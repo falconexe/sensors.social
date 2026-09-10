@@ -9,6 +9,43 @@
       class="gif"
     />
 
+    <div class="compare-promo" v-if="promo">
+      <p>
+        {{
+          $t(
+            "Altruist is two devices working as one. Urban goes outside and measures what the street does to your air: PM2.5 and PM10, temperature, humidity, pressure and noise in decibels. Insight stays in the room and measures what you actually breathe: CO2 through an NDIR sensor, shown on an e-ink screen you can read from across the table."
+          )
+        }}
+      </p>
+      <ul>
+        <li>
+          <b>{{ $t("Open from the firmware up.") }}</b>
+          {{
+            $t(
+              "The firmware, the schematics and the open source cloud it talks to are all public. You can read the code, change it, and build on it."
+            )
+          }}
+        </li>
+        <li>
+          <b>{{ $t("Works on its own.") }}</b>
+          {{
+            $t(
+              "Local control over your own network, a native Home Assistant integration and a microSD card for history. The device keeps measuring and showing data with no internet connection at all."
+            )
+          }}
+        </li>
+        <li>
+          <b>{{ $t("Your data, your call.") }}</b>
+          {{
+            $t(
+              "Publish your measurements to the open source cloud and they join a public map, or keep everything inside your own network."
+            )
+          }}
+        </li>
+      </ul>
+      <p>{{ $t("Here is how Altruist measures up, feature by feature.") }}</p>
+    </div>
+
     <div class="compare-table">
       <table>
         <thead>
@@ -30,11 +67,12 @@
             <td>{{ row.feature }}</td>
             <td
               v-for="(value, i) in [
+                row.urban,
                 row.altruist,
-                row.purpleair,
-                row.airgradient,
-                row.netatmo,
                 row.airvisual,
+                row.airgradient,
+                row.purpleair,
+                row.netatmo,
               ]"
               :key="i"
               :class="getMarkClass(value.mark)"
@@ -50,10 +88,13 @@
                 </div>
               </template>
 
-              <template v-if="row.feature === 'Price'">
-                <a :href="priceLinks[i]" target="_blank"
+              <template v-if="row.feature === 'Price' && i < 2">
+                <a :href="i === 0 ? urbanLink : storeLink"
                   ><b>{{ formatValue(value) }}</b></a
                 >
+              </template>
+              <template v-else-if="row.feature === 'Price'">
+                <b>{{ formatValue(value) }}</b>
               </template>
               <template v-else>
                 {{ formatValue(value) }}
@@ -63,11 +104,15 @@
         </tbody>
       </table>
     </div>
+
+    <p class="compare-cta">
+      <a :href="storeLink" class="button">{{ $t("Buy on Cyberpunks.shop") }}</a>
+    </p>
   </section>
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted } from "vue";
+import { computed, ref, onMounted, onUnmounted } from "vue";
 
 import altruistImg from "@/assets/images/altruist-device/Altruist-bundle.webp";
 import purpleAirImg from "@/assets/images/compare-table/purpleAir-device.webp";
@@ -80,35 +125,61 @@ const { t: $t } = useI18n();
 
 const props = defineProps({
   gif: { type: Boolean, default: false },
+  promo: { type: Boolean, default: false },
 });
 
 const deviceHeaders = [
-  { name: $t("Altruist Urban & Insight"), img: altruistImg },
-  { name: $t("PurpleAir Zen"), img: purpleAirImg },
-  { name: $t("AirGradient Indoor & Outdoor"), img: airGradientImg },
-  { name: $t("Netatmo Weather Station"), img: netatmoImg },
+  // TODO: заменить на фото самого Urban, сейчас стоит снимок комплекта.
+  { name: $t("Altruist Urban"), img: altruistImg },
+  { name: $t("Altruist Dual"), img: altruistImg },
   { name: $t("AirVisual Pro & Outdoor"), img: airVisualImg },
+  { name: $t("AirGradient Indoor & Outdoor"), img: airGradientImg },
+  { name: $t("PurpleAir Zen"), img: purpleAirImg },
+  { name: $t("Netatmo Weather Station"), img: netatmoImg },
 ];
 
-const priceLinks = [
-  "https://www.indiegogo.com/projects/altruist-air-quality-bundle-urban-insight?utm_source=sensors.social&utm_medium=compare",
-  "https://www2.purpleair.com/products/purpleair-zen",
-  "https://www.airgradient.com",
-  "https://www.netatmo.com/en-gb/weather-station-original-sand",
-  "https://www.iqair.com/us/air-quality-monitors",
-];
+const STORE_URLS = {
+  urban: "https://cyberpunks.shop/en/altruist-urban",
+  dual: "https://cyberpunks.shop/en/altruist-dual",
+};
+
+// Метки клика переносим из адреса страницы в ссылку на магазин: замер стоит
+// там, а не здесь, и без gclid платный клик не свяжется с заказом.
+const PASS_THROUGH = ["gclid", "gbraid", "wbraid", "msclkid", "fbclid"];
+
+const buildStoreLink = (target) => {
+  const incoming = new URLSearchParams(window.location.search);
+  const url = new URL(target);
+  for (const key of PASS_THROUGH) {
+    const value = incoming.get(key);
+    if (value) url.searchParams.set(key, value);
+  }
+  for (const [key, value] of incoming.entries()) {
+    if (key.startsWith("utm_")) url.searchParams.set(key, value);
+  }
+  if (!url.searchParams.has("utm_source")) {
+    url.searchParams.set("utm_source", "sensors.social");
+    url.searchParams.set("utm_medium", "compare");
+  }
+  return url.toString();
+};
+
+const urbanLink = computed(() => buildStoreLink(STORE_URLS.urban));
+const storeLink = computed(() => buildStoreLink(STORE_URLS.dual));
 
 const tableData = [
   {
     feature: $t("Price"),
-    altruist: { value: "€189 ($221)", mark: " " },
-    purpleair: { value: "€254 ($299)", mark: " " },
-    airgradient: { value: "€328 ($385)", mark: " " },
-    netatmo: { value: "€152 ($179)", mark: " " },
-    airvisual: { value: "€638 ($748)", mark: " " },
+    urban: { value: "€210 ($244)", mark: " " },
+    altruist: { value: "€360 ($418)", mark: " " },
+    purpleair: { value: "€257 ($299)", mark: " " },
+    airgradient: { value: "€392 ($455)", mark: " " },
+    netatmo: { value: "€150 ($174)", mark: " " },
+    airvisual: { value: "€542 ($630)", mark: " " },
   },
   {
     feature: $t("Type"),
+    urban: { value: $t("Single outdoor module"), mark: " " },
     altruist: { value: $t("Dual-module, outdoor and indoor"), mark: " " },
     purpleair: { value: $t("Can be outdoor or indoor"), mark: " " },
     airgradient: { value: $t("Two separate modules"), mark: " " },
@@ -117,6 +188,7 @@ const tableData = [
   },
   {
     feature: $t("Particle Sensor"),
+    urban: { value: $t("Yes"), mark: "good" },
     altruist: { value: $t("Yes"), mark: "good" },
     purpleair: { value: $t("Yes"), mark: "good" },
     airgradient: { value: $t("Yes"), mark: "good" },
@@ -125,6 +197,7 @@ const tableData = [
   },
   {
     feature: $t("Urban Noise Sensor"),
+    urban: { value: $t("Yes"), mark: "good" },
     altruist: { value: $t("Yes"), mark: "good" },
     purpleair: { value: $t("No"), mark: "bad" },
     airgradient: { value: $t("No"), mark: "bad" },
@@ -133,6 +206,7 @@ const tableData = [
   },
   {
     feature: $t("Indoor CO2"),
+    urban: { value: $t("No"), mark: "bad" },
     altruist: { value: $t("Yes"), mark: "good" },
     purpleair: { value: $t("No"), mark: "bad" },
     airgradient: { value: $t("Yes"), mark: "good" },
@@ -141,6 +215,7 @@ const tableData = [
   },
   {
     feature: $t("User Interface on Device"),
+    urban: { value: $t("LED indication"), mark: "neutral" },
     altruist: { value: $t("LED indication on Urban + E-ink screen on Insight"), mark: "neutral" },
     purpleair: { value: $t("Only LED strip"), mark: "neutral" },
     airgradient: { value: $t("LED indication and small screen on Indoor"), mark: "neutral" },
@@ -149,6 +224,7 @@ const tableData = [
   },
   {
     feature: $t("microSD Support"),
+    urban: { value: $t("Yes"), mark: "good" },
     altruist: { value: $t("Yes"), mark: "good" },
     purpleair: { value: $t("Yes"), mark: "good" },
     airgradient: { value: $t("No"), mark: "bad" },
@@ -157,6 +233,7 @@ const tableData = [
   },
   {
     feature: $t("Power Connector"),
+    urban: { value: $t("USB Type-C"), mark: "good" },
     altruist: { value: $t("USB Type-C"), mark: "good" },
     purpleair: { value: $t("Micro USB"), mark: "bad" },
     airgradient: { value: $t("USB Type-C"), mark: "good" },
@@ -165,6 +242,7 @@ const tableData = [
   },
   {
     feature: $t("Housing"),
+    urban: { value: $t("3D printed, different colors and icons"), mark: "good" },
     altruist: { value: $t("3D printed, different colors and icons"), mark: "good" },
     purpleair: { value: $t("Only one color available"), mark: "bad" },
     airgradient: { value: $t("Only one color available"), mark: "bad" },
@@ -173,6 +251,7 @@ const tableData = [
   },
   {
     feature: $t("Water Protection"),
+    urban: { value: $t("Fully sealed housing, air supply tube"), mark: "good" },
     altruist: { value: $t("Fully sealed housing, air supply tube"), mark: "good" },
     purpleair: { value: $t("Unprotected open bottom of the sensor"), mark: "bad" },
     airgradient: { value: $t("Fully sealed housing"), mark: "good" },
@@ -181,6 +260,7 @@ const tableData = [
   },
   {
     feature: $t("UV Protection"),
+    urban: { value: $t("Protective shield made of ASA plastic"), mark: "good" },
     altruist: { value: $t("Protective shield made of ASA plastic"), mark: "good" },
     purpleair: { value: $t("Not specified"), mark: "bad" },
     airgradient: { value: $t("Housing is made of ASA plastic"), mark: "good" },
@@ -189,6 +269,7 @@ const tableData = [
   },
   {
     feature: $t("Mandatory Cloud Connection"),
+    urban: { value: $t("No"), mark: "good" },
     altruist: { value: $t("No"), mark: "good" },
     purpleair: { value: $t("Yes"), mark: "bad" },
     airgradient: { value: $t("No"), mark: "good" },
@@ -197,6 +278,7 @@ const tableData = [
   },
   {
     feature: $t("Local Device Management via IP"),
+    urban: { value: $t("Full control over settings"), mark: "good" },
     altruist: { value: $t("Full control over settings"), mark: "good" },
     purpleair: {
       value: $t("Most functions are not available, settings only via corporate cloud"),
@@ -208,6 +290,7 @@ const tableData = [
   },
   {
     feature: $t("Online Air Quality Map by Community"),
+    urban: { value: $t("Yes, optional"), mark: "good" },
     altruist: { value: $t("Yes, optional"), mark: "good" },
     purpleair: { value: $t("Yes, main entry point to view data"), mark: "good" },
     airgradient: { value: $t("Yes, optional"), mark: "good" },
@@ -216,6 +299,7 @@ const tableData = [
   },
   {
     feature: $t("Home Assistant Integration"),
+    urban: { value: $t("Yes, only the HA addon is needed"), mark: "good" },
     altruist: { value: $t("Yes, only the HA addon is needed"), mark: "good" },
     purpleair: { value: $t("Yes, but limited API and cloud connection are required"), mark: "bad" },
     airgradient: { value: $t("Yes, only the HA addon is needed"), mark: "good" },
@@ -224,6 +308,7 @@ const tableData = [
   },
   {
     feature: $t("Data Control and Ownership"),
+    urban: { value: $t("The user owns the data and controls its distribution"), mark: "good" },
     altruist: { value: $t("The user owns the data and controls its distribution"), mark: "good" },
     purpleair: {
       value: $t(
@@ -250,6 +335,7 @@ const tableData = [
   },
   {
     feature: $t("Open Source and Hardware"),
+    urban: { value: $t("Yes"), mark: "good" },
     altruist: { value: $t("Yes"), mark: "good" },
     purpleair: { value: $t("No"), mark: "bad" },
     airgradient: { value: $t("Yes"), mark: "good" },
@@ -258,6 +344,7 @@ const tableData = [
   },
   {
     feature: $t("Custom Firmware and DIY-mods"),
+    urban: { value: $t("Yes"), mark: "good" },
     altruist: { value: $t("Yes"), mark: "good" },
     purpleair: { value: $t("No"), mark: "bad" },
     airgradient: { value: $t("Yes"), mark: "good" },
@@ -439,5 +526,23 @@ h2 {
   display: block;
   width: 100%;
   margin-bottom: calc(var(--gap) * 2);
+}
+
+.compare-promo {
+  max-width: 800px;
+  margin: calc(var(--gap) * 1.5) auto calc(var(--gap) * 2);
+}
+
+.compare-promo ul {
+  padding-left: 1.2rem;
+}
+
+.compare-promo li {
+  margin-bottom: 0.6rem;
+}
+
+.compare-cta {
+  margin-top: 2rem;
+  text-align: center;
 }
 </style>
