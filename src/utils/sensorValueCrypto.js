@@ -3,7 +3,7 @@ import {
   decryptAesGcm256,
   decryptXChaCha20Poly1305,
   XCHACHA20POLY1305_ALGORITHM,
-} from "@sensors-social/crypto";
+} from "./sensorsSocialCrypto.js";
 import bs58 from "bs58";
 
 import { cryptoWaitReady, decodeAddress, mnemonicToMiniSecret } from "@polkadot/util-crypto";
@@ -166,7 +166,7 @@ async function publicKeyFromField(fromField) {
 }
 
 /**
- * Decrypt a proto `crypto.v1.Encrypted` blob with `@sensors-social/crypto`.
+ * Decrypt a proto `crypto.v1.Encrypted` blob.
  * @returns {Promise<Uint8Array|null>} plaintext bytes or null
  */
 export async function decryptCpsBinary({

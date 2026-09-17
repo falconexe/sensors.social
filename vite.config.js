@@ -6,51 +6,21 @@ import path from "path";
 import prerender from "@prerenderer/rollup-plugin";
 import vue from "@vitejs/plugin-vue";
 import Markdown from "unplugin-vue-markdown/vite";
-import { defineConfig, transformWithEsbuild } from "vite";
+import { defineConfig } from "vite";
 import fg from "fast-glob";
 
-function findSensorsSocialCryptoDir() {
-  const candidates = [
-    fileURLToPath(new URL("./node_modules/@sensors-social/crypto/packages/crypto/", import.meta.url)),
-    fileURLToPath(new URL("./node_modules/@sensors-social/crypto/", import.meta.url)),
-  ];
-  for (const dir of candidates) {
-    if (fs.existsSync(path.join(dir, "src", "aesgcm.ts"))) return dir;
-  }
-  return null;
-}
-
-const CRYPTO_DIR = findSensorsSocialCryptoDir();
-const CRYPTO_SRC = (CRYPTO_DIR || "").replace(/\\/g, "/");
-const CRYPTO_SRC_ALIAS = CRYPTO_DIR
-  ? path.resolve(CRYPTO_DIR, "src").replace(/\\/g, "/")
-  : null;
-
-function resolveCryptoSource(id) {
-  const match = id.match(/^@sensors-social\/crypto\/(?:packages\/crypto\/)?src\/(.+)$/);
-  if (!match || !CRYPTO_DIR) return null;
-  const target = path.resolve(CRYPTO_DIR, "src", match[1]);
-  if (fs.existsSync(target)) return target;
-  if (fs.existsSync(`${target}.ts`)) return `${target}.ts`;
-  return null;
-}
-
-function isCryptoPackageFile(file) {
-  const normalized = file.replace(/\\/g, "/");
-  if (CRYPTO_SRC && normalized.includes(CRYPTO_SRC)) return true;
-  return normalized.includes("/node_modules/@sensors-social/crypto/");
-}
-
-function sensorsSocialCrypto() {
+function nobleV2Aliases() {
   return {
-    name: "sensors-social-crypto",
+    name: "noble-v2-aliases",
     enforce: "pre",
     async resolveId(id, importer) {
-      const cryptoFile = resolveCryptoSource(id);
-      if (cryptoFile) return cryptoFile;
       if (!importer) return null;
       const from = importer.split("?")[0].replace(/\\/g, "/");
-      if (!isCryptoPackageFile(from)) return null;
+      const needsV2 =
+        from.includes("/src/utils/sensorsSocialCrypto.js") ||
+        from.includes("/node_modules/sensors-social-noble-curves/") ||
+        from.includes("/node_modules/sensors-social-noble-hashes/");
+      if (!needsV2) return null;
       if (id.startsWith("@noble/curves/")) {
         return this.resolve(`sensors-social-noble-curves${id.slice("@noble/curves".length)}`, importer, {
           skipSelf: true,
@@ -62,15 +32,6 @@ function sensorsSocialCrypto() {
         });
       }
       return null;
-    },
-    async transform(code, id) {
-      const file = id.split("?")[0].replace(/\\/g, "/");
-      if (!isCryptoPackageFile(file) || !file.endsWith(".ts")) return null;
-      return transformWithEsbuild(code, id, {
-        loader: "ts",
-        format: "esm",
-        tsconfigRaw: { compilerOptions: { target: "es2020" } },
-      });
     },
   };
 }
@@ -90,7 +51,7 @@ export default defineConfig(() => {
     base: "/",
     // server: { https: true },
     plugins: [
-      sensorsSocialCrypto(),
+      nobleV2Aliases(),
       vue({include: [/\.vue$/, /\.md$/]}),
       {
         name: "copy-blog-images",
@@ -142,22 +103,6 @@ export default defineConfig(() => {
     ],
     resolve: {
       alias: [
-        ...(CRYPTO_SRC_ALIAS
-          ? [
-              {
-                find: /^@sensors-social\/crypto\/packages\/crypto\/src\/(.*)$/,
-                replacement: `${CRYPTO_SRC_ALIAS}/$1`,
-              },
-              {
-                find: /^@sensors-social\/crypto\/src\/(.*)$/,
-                replacement: `${CRYPTO_SRC_ALIAS}/$1`,
-              },
-            ]
-          : []),
-        {
-          find: /^@sensors-social\/crypto$/,
-          replacement: fileURLToPath(new URL("./src/utils/sensorsSocialCrypto.js", import.meta.url)),
-        },
         { find: "@", replacement: fileURLToPath(new URL("./src", import.meta.url)) },
         { find: "@config", replacement: fileURLToPath(new URL("./src/config", import.meta.url)) },
       ],
@@ -169,7 +114,6 @@ export default defineConfig(() => {
       esbuildOptions: {
         target: ["es2020"],
       },
-      exclude: ["@sensors-social/crypto"],
       include: [
         "@bufbuild/protobuf",
         "@fortawesome/fontawesome-svg-core",
