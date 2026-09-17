@@ -158,31 +158,33 @@
             :show-geo-in-tooltip="showChartGeoInTooltip"
             :address-for-timestamp="chartAddressForTimestamp"
             @active-legend-change="chartActiveLegendKey = $event"
-          />
-          <div
-            v-if="showEncryptedLoginNotice"
-            class="chart-encrypted-overlay"
-            role="status"
-            aria-live="polite"
           >
-            <div class="chart-encrypted-overlay__card">
-              <font-awesome-icon
-                icon="fa-solid fa-lock"
-                class="chart-encrypted-overlay__icon"
-                aria-hidden="true"
-              />
-              <p class="chart-encrypted-overlay__text">
-                {{
-                  encryptedNoticeIsLogin
-                    ? t("sensorpopup.encrypted_login_notice")
-                    : t("sensorpopup.encrypted_decrypt_pending")
-                }}
-              </p>
-              <router-link to="/login/" class="chart-encrypted-overlay__cta">
-                {{ t("Login") }}
-              </router-link>
-            </div>
-          </div>
+            <template v-if="showEncryptedLoginNotice" #plot-overlay>
+              <div
+                class="chart-encrypted-overlay"
+                role="status"
+                aria-live="polite"
+              >
+                <div class="chart-encrypted-overlay__card">
+                  <font-awesome-icon
+                    icon="fa-solid fa-lock"
+                    class="chart-encrypted-overlay__icon"
+                    aria-hidden="true"
+                  />
+                  <p class="chart-encrypted-overlay__text">
+                    {{
+                      encryptedNoticeIsLogin
+                        ? t("sensorpopup.encrypted_login_notice")
+                        : t("sensorpopup.encrypted_decrypt_pending")
+                    }}
+                  </p>
+                  <router-link to="/login/" class="chart-encrypted-overlay__cta">
+                    {{ t("Login") }}
+                  </router-link>
+                </div>
+              </div>
+            </template>
+          </Chart>
         </div>
         <div v-else-if="showNoDataMessage" class="no-data-message">
           {{ $t("No data available") }}
@@ -1073,8 +1075,7 @@ watch(
   position: relative;
 }
 
-.chart-area--locked :deep(.chart-section-chart),
-.chart-area--locked :deep(.custom-legend) {
+.chart-area--locked :deep(.highcharts-container) {
   filter: blur(2px);
   pointer-events: none;
   user-select: none;

@@ -79,11 +79,12 @@
                 <div v-else class="sensor-chips">
                   <router-link
                     v-for="sensor in accountSensors(acc)"
-                    :key="sensor"
+                    :key="canonicalSensorId(sensor) || sensor"
                     class="sensor-chip"
                     :to="getSensorLink(sensor)"
+                    :title="canonicalSensorId(sensor) || sensor"
                   >
-                    {{ sensor }}
+                    {{ formatSensorIdShort(sensor) }}
                   </router-link>
                 </div>
               </div>
@@ -197,7 +198,8 @@ import { generateAvatar } from "@/utils/avatarGenerator";
 
 import MetaInfo from "../components/MetaInfo.vue";
 import PageTextLayout from "../components/layouts/PageText.vue";
-import Copy from "@/components/controls/Copy.vue";
+import { formatSensorIdShort } from "@/composables/sensorDeviceTypes";
+import { canonicalSensorId } from "@/utils/sensorId";
 
 const accountStore = useAccounts();
 const router = useRouter();
@@ -223,9 +225,13 @@ function accountSensors(acc) {
   const addr = acc?.address;
   if (!addr) return [];
   const loaded = sensorsByAddr.value[addr];
-  if (Array.isArray(loaded) && loaded.length > 0) return loaded;
-  if (Array.isArray(acc?.devices) && acc.devices.length > 0) return acc.devices;
-  return [];
+  const raw =
+    Array.isArray(loaded) && loaded.length > 0
+      ? loaded
+      : Array.isArray(acc?.devices) && acc.devices.length > 0
+        ? acc.devices
+        : [];
+  return [...new Set(raw.map((id) => canonicalSensorId(id)).filter(Boolean))];
 }
 
 onMounted(() => {
@@ -405,12 +411,13 @@ async function removeOne(acc) {
 }
 
 function getSensorLink(sensor) {
+  const sid = canonicalSensorId(sensor) || sensor;
   return {
     name: "main",
     query: {
       provider: "remote",
       type: config.MAP.measure,
-      sensor: sensor,
+      sensor: sid,
     },
   };
 }

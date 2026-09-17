@@ -8,6 +8,7 @@ import {
   listBundleSensorEntries,
   hasSensorOwner,
   sensorTypeFromDeviceModel,
+  canonicalSensorId,
 } from "../utils/map/sensors/requests";
 
 import diyPrototypeIcon from "@/assets/images/altruist-device/altruist-diy-prototype.webp";
@@ -27,20 +28,21 @@ export function resolveSensorType(point, logOverride = null) {
   const fromModel = sensorTypeFromDeviceModel(point.device_model);
   if (fromModel) return fromModel;
 
-  const log = logOverride ?? (Array.isArray(point?.logs) ? point.logs : null);
-  const fromLog = inferDeviceTypeFromLog(log);
-  if (fromLog) return fromLog;
-
   const sid = String(point.sensor_id || "");
   const fromBundle = Array.isArray(point.ownerSensorsWithData)
     ? point.ownerSensorsWithData.find((o) => String(o?.id || o?.sensor_id || "") === sid)?.type
     : null;
-  if (fromBundle) return fromBundle;
+  if (fromBundle === "insight" || fromBundle === "urban" || fromBundle === "diy") {
+    return fromBundle;
+  }
+
+  const cached = point.idbSensorType;
+  if (cached && cached !== "altruist") return cached;
 
   if (sid) {
     const meta = getCachedSensorMeta(sid);
     if (meta) {
-      const entry = listBundleSensorEntries(meta).find((e) => String(e.sensor_id) === sid);
+      const entry = listBundleSensorEntries(meta).find((e) => String(e.sensor_id || "") === sid);
       const fromMeta = sensorTypeFromDeviceModel(entry?.device_model);
       if (fromMeta) return fromMeta;
       const fromMetaLog = inferDeviceTypeFromLog(meta?.data?.[sid]);
@@ -48,15 +50,16 @@ export function resolveSensorType(point, logOverride = null) {
     }
   }
 
-  const cached = point.idbSensorType;
-  if (cached && cached !== "altruist") return cached;
+  const log = logOverride ?? (Array.isArray(point?.logs) ? point.logs : null);
+  const fromLog = inferDeviceTypeFromLog(log);
+  if (fromLog) return fromLog;
 
   return "altruist";
 }
 
-/** Short id for picker label: `4Hq6vZ…YUrZV`. */
+/** Short id for picker label: `4Hq6vZ…YUrZV` (Robonomics SS58 prefix 32). */
 export function formatSensorIdShort(id) {
-  const s = String(id || "");
+  const s = canonicalSensorId(id);
   if (!s) return "";
   if (s.length <= 14) return s;
   return `${s.slice(0, 6)}…${s.slice(-6)}`;

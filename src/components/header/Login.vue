@@ -60,11 +60,12 @@
             <div v-else class="sensor-chips">
               <router-link
                 v-for="sensor in acc.sensors"
-                :key="sensor"
+                :key="canonicalSensorId(sensor) || sensor"
                 class="sensor-chip"
                 :to="getSensorLink(sensor)"
+                :title="canonicalSensorId(sensor) || sensor"
               >
-                {{ sensor }}
+                {{ formatSensorIdShort(sensor) }}
               </router-link>
             </div>
           </div>
@@ -90,7 +91,8 @@ import { ref, onMounted, watch } from "vue";
 import { useAccounts } from "@/composables/useAccounts";
 import config from "@/config/default/config.json";
 import Copy from "@/components/controls/Copy.vue";
-import { generateAvatar } from "@/utils/avatarGenerator";
+import { formatSensorIdShort } from "@/composables/sensorDeviceTypes";
+import { canonicalSensorId } from "@/utils/sensorId";
 
 const accountStore = useAccounts();
 const accounts = ref([]);
@@ -150,12 +152,13 @@ function collapseAddress(addr) {
 
 // Сформировать ссылку на сенсор
 function getSensorLink(sensor) {
+  const sid = canonicalSensorId(sensor) || sensor;
   return {
     name: "main",
     query: {
-      provider: "remote", // Default provider for login redirect
+      provider: "remote",
       type: config.MAP.measure,
-      sensor: sensor,
+      sensor: sid,
     },
   };
 }

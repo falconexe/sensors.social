@@ -54,6 +54,10 @@ function hasFiniteNumber(v) {
   return Number.isFinite(x);
 }
 
+export function isMapReady() {
+  return Boolean(map);
+}
+
 // Get existing map instance
 export function instanceMap() {
   if (map) return map;
@@ -65,9 +69,10 @@ export function removeMap() {
   if (map) {
     map.remove();
     map = undefined;
-    boundsLimit = undefined;
-    mode = "world";
   }
+  boundsLimit = undefined;
+  mode = "world";
+  mapContext = null;
 }
 
 // Initialize map
@@ -184,7 +189,6 @@ export function setTheme(theme) {
  * @param {boolean} options.setZoom - Устанавливать зум
  */
 export function moveMap(position, zoom, options = {}) {
-  const map = instanceMap();
   if (!map) return;
 
   const { popup = false, animate = true, setZoom = true } = options;
@@ -199,6 +203,7 @@ export function moveMap(position, zoom, options = {}) {
 
     // Используем setTimeout для ожидания рендеринга попапа
     setTimeout(() => {
+      if (!map) return;
       const popupElement = document.querySelector(".popup-js.active");
 
       if (popupElement) {

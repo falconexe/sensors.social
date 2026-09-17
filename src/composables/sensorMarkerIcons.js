@@ -24,7 +24,6 @@ import {
   peekMarkerIconCache,
   rememberMarkerIcon,
   rosemanMarkerIconsEnabledForDate,
-  sensorTypeFromDeviceModel,
 } from "../utils/map/sensors/requests";
 import { hasValidCoordinates } from "../utils/utils";
 
@@ -104,17 +103,16 @@ export function ownerBundleHasDualDevices(point, sensorsList = null) {
   const sid = point?.sensor_id ? String(point.sensor_id) : "";
   const meta = sid ? getCachedSensorMeta(sid) : null;
   if (meta) {
-    const anchorGeo = resolveBundleAnchorGeo(point, sensorsList);
-    const fromMeta = listBundleSensorEntries(meta)
+    const metaIds = listBundleSensorEntries(meta)
       .filter((entry) => {
-        if (!hasValidCoordinates(anchorGeo)) return true;
+        if (!hasValidCoordinates(resolveBundleAnchorGeo(point, sensorsList))) return true;
         return isMarkerSiblingNearAnchor(entry.sensor_id, point, sensorsList);
       })
-      .map((entry) => ({
-        id: entry.sensor_id,
-        type: sensorTypeFromDeviceModel(entry.device_model),
-      }));
-    if (ownerBundleHasDualFromBundle(fromMeta)) return true;
+      .map((entry) => entry.sensor_id);
+    if (metaIds.length >= 2) {
+      const typed = inferTypesForOwnerIds(metaIds, sensorsList, point);
+      if (ownerBundleHasDualFromBundle(typed.map(({ id, type }) => ({ id, type })))) return true;
+    }
   }
 
   const ownerKey = normalizeOwnerKey(point);

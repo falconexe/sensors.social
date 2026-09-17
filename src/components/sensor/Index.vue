@@ -1,7 +1,7 @@
 <template>
   <div class="popup-js active">
     
-    <div class="sensor-header">
+    <div class="sensor-header" :class="{ 'sensor-header--proto': isProto }">
       <div v-if="!isBookmarked && !showBookmarkForm" class="title title-bookmark-no">
         <button
           v-if="hasAddress"
@@ -90,6 +90,11 @@
       <button @click.prevent="closesensor" aria-label="Close sensor" class="close">
         <font-awesome-icon icon="fa-solid fa-xmark" />
       </button>
+      <span
+        v-if="isProto"
+        class="sensor-header__proto"
+        :title="t('sensorpopup.proto_signed')"
+      >proto</span>
     </div>
 
     <div class="scrollable-y" :class="{ 'scrollable-y--kiosk': isDemo && activeTab === 'chart' }">
@@ -238,6 +243,7 @@ const headerFallbackLabel = computed(() => {
   const id = formatSensorIdShort(point.value?.sensor_id);
   return id ? t("sensorpopup.sensorIdHeader", { id }) : "";
 });
+const isProto = computed(() => point.value?.proto === true);
 const isAddressLoading = computed(
   () => logGeoAddresses.loading.value && !displayAddress.value
 );
@@ -547,6 +553,10 @@ watch(
   padding-right: calc(var(--close-size) + var(--gap)*2);
 }
 
+.sensor-header--proto .title {
+  padding-right: calc(var(--close-size) + var(--gap)*2 + 2.8em);
+}
+
 .sensor-header h3 {
   margin-bottom: 0;
 }
@@ -561,6 +571,20 @@ watch(
 
 .sensor-header .close .fa-xmark {
   height: var(--close-size);
+}
+
+.sensor-header__proto {
+  position: absolute;
+  right: calc(var(--close-size) + var(--gap) * 2);
+  top: var(--gap);
+  font-size: 10px;
+  line-height: 1.2;
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: var(--color-dark);
+  color: var(--color-light);
+  letter-spacing: 0.03em;
+  text-transform: lowercase;
 }
 
 .sensor-header .title-bookmark-no {

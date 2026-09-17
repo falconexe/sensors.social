@@ -20,6 +20,7 @@ import {
   getMaxData,
   getSensorOwner,
   getCachedSensorIdbMeta,
+  getCachedSensorMeta,
   clearSensorMetaCache,
   getCachedMaxDataValue,
   getCachedMaxDataEntry,
@@ -33,6 +34,10 @@ import {
   sensorFetchBoundsForDate,
   sensorTypeFromDeviceModel,
   inferDeviceTypeFromLog,
+  getProvider,
+  canonicalSensorId,
+  preloadSensorMeta,
+  listBundleSensorEntries,
 } from "../utils/map/sensors/requests";
 import { hasValidCoordinates } from "../utils/utils";
 import { dayISO, timelineFetchBounds } from "@/utils/date";
@@ -42,8 +47,11 @@ import converter from "../measurements";
 import {
   decryptMeasurementBag,
   measurementBagHasEncryptedValues,
+  mergeMeasurementBags,
+  hasPendingProtoPrivate,
 } from "../utils/sensorValueCrypto";
-import { getProvider } from "../utils/map/sensors/requests";
+import { decryptProtoPrivate } from "../utils/proto/decodeEnvelope";
+import { pressureToMmHg } from "../utils/pressureMmHg";
 
 import {
   resolveSensorType,
@@ -65,6 +73,7 @@ import {
   collectOwnerClusterSensorIds,
   pickSensorIdForMapUnit,
   ownerBundleSig,
+  ownerBundleHasPair,
   markerSensorsEntries,
   unitValueFromBag,
   ensureOwnerSensorIds,
@@ -78,6 +87,10 @@ import { mapMarkerIcon, refreshMarkerIconsForSensors } from "./sensorMarkerIcons
 /** Roseman API uses -1 for pm25/pm10 as “no reading” — strip from log points. */
 const PM_LOG_KEYS = ["pm25", "pm10"];
 const DEFAULT_SENSOR_MODEL = 2;
+
+function idsEq(a, b) {
+  return String(a || "") === String(b || "");
+}
 
 const createDefaultLogsProgress = () => ({
   status: "idle",
@@ -105,7 +118,7 @@ let ownerDecryptWatchersRegistered = false;
 let setSensorDataHandler = null;
 let updateSensorLogsHandler = null;
 
-const ownerPromises = new Map();
+const bundleIconMetaInflight = new Set();
 
 // --- Refs ---
 
@@ -155,11 +168,16 @@ async function redecryptLogEntries(sensorId, logs, ownerAccount) {
   let changed = false;
   const next = await Promise.all(
     logs.map(async (item) => {
-      if (!item?.data || !measurementBagHasEncryptedValues(item.data)) return item;
-      const data = await redecryptDataBag(sensorId, item.data, ownerAccount);
-      if (JSON.stringify(data) === JSON.stringify(item.data)) return item;
+      let current = item;
+      if (Array.isArray(item?.protoPrivate) && item.protoPrivate.length > 0) {
+        current = await decryptProtoPrivate(item, ownerAccount);
+        if (current !== item) changed = true;
+      }
+      if (!current?.data || !measurementBagHasEncryptedValues(current.data)) return current;
+      const data = await redecryptDataBag(sensorId, current.data, ownerAccount);
+      if (JSON.stringify(data) === JSON.stringify(current.data)) return current;
       changed = true;
-      return { ...item, data };
+      return { ...current, data };
     })
   );
   return { logs: next, changed };
@@ -185,7 +203,7 @@ async function hydrateRealtimeLogsForSensor(sensorId, existingLogs, ownerAccount
 }
 
 function isSensorOpenFor(sensorId) {
-  return sensorPoint.value && String(sensorPoint.value.sensor_id) === String(sensorId);
+  return sensorPoint.value && sensorPoint.value.sensor_id === sensorId;
 }
 
 
@@ -196,6 +214,12 @@ function historyPointsToLogs(history) {
       const ts = Number(p?.timestamp);
       if (!Number.isFinite(ts) || !p?.data) return null;
       const entry = { timestamp: ts, data: p.data };
+      if (p.proto === true) entry.proto = true;
+      if (p.device_model) entry.device_model = p.device_model;
+      if (p.owner) entry.owner = p.owner;
+      if (Array.isArray(p.protoPrivate) && p.protoPrivate.length > 0) {
+        entry.protoPrivate = p.protoPrivate;
+      }
       if (p.geo && Number.isFinite(Number(p.geo.lat)) && Number.isFinite(Number(p.geo.lng))) {
         entry.geo = p.geo;
       }
@@ -267,7 +291,7 @@ async function redecryptAllRealtimeHistory(accountsList) {
       if (setSensorDataHandler) {
         setSensorDataHandler(sid, {
           data: latest.data,
-          owner: latest.owner || null,
+          ...(latest.owner ? { owner: latest.owner } : {}),
           geo: latest.geo,
           model: latest.model,
           device_model: latest.device_model,
@@ -292,13 +316,25 @@ async function runOwnerDecrypt() {
 
   const needsDataDecrypt = measurementBagHasEncryptedValues(popup.data);
   const needsLogsDecrypt = logHasEncryptedValues(popup.logs);
-  if (!needsDataDecrypt && !needsLogsDecrypt && mapState.currentProvider.value !== "realtime") {
+  const needsProtoPrivate = hasPendingProtoPrivate(popup);
+  if (
+    !needsDataDecrypt &&
+    !needsLogsDecrypt &&
+    !needsProtoPrivate &&
+    mapState.currentProvider.value !== "realtime"
+  ) {
     return;
   }
 
   let nextData = popup.data;
-  if (needsDataDecrypt) {
-    nextData = await redecryptDataBag(sensorId, popup.data, ownerAccount);
+  let nextProtoPrivate = popup.protoPrivate;
+  if (needsProtoPrivate) {
+    const unlocked = await decryptProtoPrivate(popup, ownerAccount);
+    nextData = unlocked.data;
+    nextProtoPrivate = unlocked.protoPrivate;
+  }
+  if (needsDataDecrypt || measurementBagHasEncryptedValues(nextData)) {
+    nextData = await redecryptDataBag(sensorId, nextData, ownerAccount);
   }
 
   let logsOut = normalizeSensorLogs(popup.logs);
@@ -308,12 +344,15 @@ async function runOwnerDecrypt() {
       await provider.redecryptHistoryForSensor(sensorId, ownerAccount);
     }
     const history = historyPointsToLogs(await provider?.getHistoryBySensor?.(sensorId));
-    if (history.length > 0) {
+    const latestItem = Array.isArray(provider?.history?.[sensorId])
+      ? provider.history[sensorId][provider.history[sensorId].length - 1]
+      : null;
+    if (latestItem?.data) {
+      nextData = latestItem.data;
+      nextProtoPrivate = latestItem.protoPrivate ?? null;
+    } else if (history.length > 0) {
       const latestHistory = history[history.length - 1];
-      if (
-        latestHistory?.data &&
-        !measurementBagHasEncryptedValues(latestHistory.data)
-      ) {
+      if (latestHistory?.data && !measurementBagHasEncryptedValues(latestHistory.data)) {
         nextData = latestHistory.data;
       }
     }
@@ -324,7 +363,9 @@ async function runOwnerDecrypt() {
   }
 
   const stillEncrypted =
-    measurementBagHasEncryptedValues(nextData) || logHasEncryptedValues(logsOut);
+    measurementBagHasEncryptedValues(nextData) ||
+    logHasEncryptedValues(logsOut) ||
+    hasPendingProtoPrivate({ protoPrivate: nextProtoPrivate });
   if (
     stillEncrypted &&
     !needsDataDecrypt &&
@@ -339,6 +380,7 @@ async function runOwnerDecrypt() {
     ...popup,
     data: nextData,
     logs: logsOut,
+    protoPrivate: nextProtoPrivate,
     owner: owner || popup.owner || ownerAccount.address || popup.owner,
     _decryptRev: decryptRev,
     _logsKey: popup._logsKey || `owner-decrypt:${sensorId}:${decryptRev}`,
@@ -347,6 +389,7 @@ async function runOwnerDecrypt() {
   if (setSensorDataHandler) {
     setSensorDataHandler(sensorId, {
       data: nextData,
+      protoPrivate: nextProtoPrivate,
       ...(logsOut.length > 0 ? { logs: logsOut } : null),
     });
   }
@@ -366,18 +409,35 @@ function pmValueMeansMissing(value) {
   return Number.isFinite(n) && n === -1;
 }
 
+function historyHasProto(sensorId) {
+  const sid = String(sensorId || "");
+  if (!sid) return false;
+  const hist = getProvider()?.history?.[sid];
+  return Array.isArray(hist) && hist.some((p) => p?.proto === true);
+}
+
 function sanitizePmFieldsInData(data) {
   if (!data || typeof data !== "object") return data;
   let next = data;
   let copied = false;
-  for (const key of PM_LOG_KEYS) {
-    if (!Object.prototype.hasOwnProperty.call(data, key)) continue;
-    if (!pmValueMeansMissing(data[key])) continue;
+  const ensureCopy = () => {
     if (!copied) {
-      next = { ...data };
+      next = { ...next };
       copied = true;
     }
+  };
+  for (const key of PM_LOG_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(next, key)) continue;
+    if (!pmValueMeansMissing(next[key])) continue;
+    ensureCopy();
     delete next[key];
+  }
+  if (Object.prototype.hasOwnProperty.call(next, "pressure")) {
+    const mm = pressureToMmHg(next.pressure);
+    if (mm !== next.pressure) {
+      ensureCopy();
+      next.pressure = mm;
+    }
   }
   return next;
 }
@@ -395,7 +455,7 @@ function sanitizeSensorLogsPmSentinels(logs) {
 function normalizeSensorLogEntry(item) {
   if (!item || typeof item !== "object") return null;
   const ts = Number(item.timestamp);
-  const data = item.data;
+  const data = sanitizePmFieldsInData(item.data);
   if (!Number.isFinite(ts) || !data || typeof data !== "object") return null;
   const entry = { timestamp: ts, data };
   if (item.geo && Number.isFinite(Number(item.geo.lat)) && Number.isFinite(Number(item.geo.lng))) {
@@ -409,17 +469,13 @@ function normalizeSensorLogs(logs) {
   return logs.map(normalizeSensorLogEntry).filter(Boolean);
 }
 
-function logEntryHasEncryptedData(entry) {
-  return measurementBagHasEncryptedValues(entry?.data);
-}
-
-/** When timestamps collide, keep decrypted readings over still-encrypted ones. */
+/** When timestamps collide, merge bags so proto public + JSON/proto-private fields coexist. */
 function preferMergedLogEntry(incumbent, candidate) {
-  const incEnc = logEntryHasEncryptedData(incumbent);
-  const candEnc = logEntryHasEncryptedData(candidate);
-  if (incEnc && !candEnc) return candidate;
-  if (!incEnc && candEnc) return incumbent;
-  return candidate;
+  return {
+    timestamp: candidate.timestamp ?? incumbent.timestamp,
+    data: mergeMeasurementBags(incumbent.data, candidate.data),
+    geo: candidate.geo || incumbent.geo,
+  };
 }
 
 function mergeSensorLogsByTimestamp(streaming, api) {
@@ -554,65 +610,13 @@ export function useSensors() {
     return fromApi || "";
   };
 
-  const applyOwnerFromCache = (sensorId, owner) => {
-    if (!owner || !sensorId) return;
-    const sid = String(sensorId);
-    const existsOnMap = sensors.value?.some((s) => String(s?.sensor_id || "") === sid);
-    if (existsOnMap) {
-      setSensorData(sid, { owner });
-    }
-    if (sensorPoint.value?.sensor_id === sid) {
-      sensorPoint.value = { ...sensorPoint.value, owner };
-    }
-    mapState.setMapSettings(route, router, { owner });
-  };
-
-  const ensureOwnerLoaded = (sensorId) => {
-    if (!sensorId) return Promise.resolve(null);
-
-    const existing = sensors.value.find((s) => s.sensor_id === sensorId);
-    if (existing?.owner) {
-      return Promise.resolve(existing.owner);
-    }
-
-    if (ownerPromises.has(sensorId)) {
-      return ownerPromises.get(sensorId);
-    }
-
-    const promise = (async () => {
-      const idbMeta = await getCachedSensorIdbMeta(sensorId);
-      if (idbMeta?.type === "diy") return null;
-      if (idbMeta?.owner) {
-        applyOwnerFromCache(sensorId, idbMeta.owner);
-        return idbMeta.owner;
-      }
-
-      const viewedDay = mapState.currentDate.value || dayISO();
-      const owner = await getSensorOwner(sensorId, viewedDay);
-      if (owner) {
-        applyOwnerFromCache(sensorId, owner);
-      }
-      return owner;
-    })()
-      .catch((error) => {
-        console.warn("Failed to load owner for sensor", sensorId, error);
-        return null;
-      })
-      .finally(() => {
-        ownerPromises.delete(sensorId);
-      });
-
-    ownerPromises.set(sensorId, promise);
-    return promise;
-  };
-
   /**
    * Whether the popup is open for the given sensor id.
    * @param {string} sensorId - Sensor id to check
    * @returns {boolean} True when popup is open for this sensor
    */
   const isSensorOpen = (sensorId) => {
-    return sensorPoint.value && sensorPoint.value.sensor_id === sensorId;
+    return sensorPoint.value && idsEq(sensorPoint.value.sensor_id, sensorId);
   };
 
   /**
@@ -629,7 +633,10 @@ export function useSensors() {
    */
   const applySensorPatchToList = (list, sensorId, data) => {
     const existingSensors = [...(Array.isArray(list) ? list : [])];
-    const sensorIndex = existingSensors.findIndex((s) => s.sensor_id === sensorId);
+    const sid = canonicalSensorId(sensorId) || String(sensorId || "");
+    const sensorIndex = existingSensors.findIndex(
+      (s) => idsEq(canonicalSensorId(s.sensor_id), sid)
+    );
 
     if (sensorIndex >= 0) {
       const existingSensor = existingSensors[sensorIndex];
@@ -640,12 +647,15 @@ export function useSensors() {
         device_model:
           data.device_model !== undefined ? data.device_model : existingSensor.device_model,
         maxdata: { ...existingSensor.maxdata, ...(data.maxdata || {}) },
-        data: { ...existingSensor.data, ...(data.data || {}) },
+        data: mergeMeasurementBags(existingSensor.data, data.data || {}),
         logs: data.logs !== undefined ? data.logs : existingSensor.logs ?? null,
         timestamp: data.timestamp ?? existingSensor.timestamp,
+        proto: data.proto === true || existingSensor.proto === true,
+        protoPrivate:
+          data.protoPrivate !== undefined ? data.protoPrivate : existingSensor.protoPrivate,
         owner:
-          data.owner !== undefined
-            ? normalizeOwnerKey({ owner: data.owner }) || null
+          data.owner !== undefined && String(data.owner || "").trim() !== ""
+            ? normalizeOwnerKey({ owner: data.owner })
             : existingSensor.owner,
       };
       existingSensors[sensorIndex] = formatPointForSensor(updatedSensor, { calculateValue: false });
@@ -653,13 +663,15 @@ export function useSensors() {
       existingSensors.push(
         formatPointForSensor(
           {
-            sensor_id: sensorId,
+            sensor_id: sid,
             geo: data.geo || { lat: 0, lng: 0 },
             device_model: data.device_model || null,
             maxdata: data.maxdata || {},
             data: data.data || {},
             logs: data.logs ?? null,
             timestamp: data.timestamp ?? null,
+            proto: data.proto === true,
+            protoPrivate: data.protoPrivate || null,
             owner: data.owner ? normalizeOwnerKey({ owner: data.owner }) : null,
           },
           { calculateValue: false }
@@ -751,27 +763,25 @@ export function useSensors() {
         sensorId
       );
 
-      if (ownerAccount) {
-        let nextData = sensorPoint.value?.data;
-        if (measurementBagHasEncryptedValues(nextData)) {
-          nextData = await redecryptDataBag(sensorId, nextData, ownerAccount);
-        }
-        const nextLogs = await hydrateRealtimeLogsForSensor(
-          sensorId,
-          sensorPoint.value?.logs,
-          ownerAccount
-        );
+      let nextData = sensorPoint.value?.data;
+      if (ownerAccount && measurementBagHasEncryptedValues(nextData)) {
+        nextData = await redecryptDataBag(sensorId, nextData, ownerAccount);
+      }
+      const nextLogs = await hydrateRealtimeLogsForSensor(
+        sensorId,
+        sensorPoint.value?.logs,
+        ownerAccount
+      );
+      if (nextLogs.length > 0) {
         const decryptRev = (sensorPoint.value?._decryptRev || 0) + 1;
         sensorPoint.value = {
           ...sensorPoint.value,
           data: nextData,
-          logs: nextLogs.length > 0 ? [...nextLogs] : [...(sensorPoint.value?.logs ?? [])],
+          logs: [...nextLogs],
           _decryptRev: decryptRev,
           _logsKey: sensorPoint.value?._logsKey || `${requestedKey}:live`,
         };
-        if (nextLogs.length > 0) {
-          setSensorData(sensorId, { data: nextData, logs: nextLogs });
-        }
+        setSensorData(sensorId, { data: nextData, logs: nextLogs });
         resetLogsProgress();
         return logRequestResult({
           ok: true,
@@ -977,7 +987,11 @@ export function useSensors() {
           if (!sensorPoint.value.device_model && logArray._cachedType !== "diy") {
             patch.device_model = logArray._cachedType;
           }
-        } else if (inferredType) {
+        } else if (
+          inferredType &&
+          !sensorPoint.value.device_model &&
+          !sensorPoint.value.idbSensorType
+        ) {
           patch.idbSensorType = inferredType;
           patch.device_model = inferredType;
         }
@@ -1043,8 +1057,11 @@ export function useSensors() {
         sensorPoint.value = {
           ...sensorPoint.value,
           logs,
+          proto:
+            sensorPoint.value?.proto === true ||
+            logs.some((item) => item?.proto === true),
           _logsKey: requestedKey,
-          ...(inferredType
+          ...(inferredType && !sensorPoint.value?.device_model
             ? { device_model: inferredType, idbSensorType: inferredType }
             : null),
           ...(ownerSensorsWithData?.length ? { ownerSensorsWithData } : null),
@@ -1056,6 +1073,7 @@ export function useSensors() {
           if (existsOnMap) {
             setSensorData(sensorId, {
               logs,
+              ...(logs.some((item) => item?.proto === true) ? { proto: true } : null),
             });
           }
         }
@@ -1153,28 +1171,42 @@ export function useSensors() {
           : null;
 
     mapState.mapinactive.value = true;
+    const prevOwner = normalizeOwnerKey(prev);
+    const nextOwner = normalizeOwnerKey(rawPoint) || prevOwner;
+    const keepBundle = Boolean(prevOwner) && nextOwner === prevOwner;
+    const mergedBundle = keepBundle
+      ? mergeOwnerBundleOptions(rawPoint?.ownerSensorsWithData, prev?.ownerSensorsWithData)
+      : rawPoint?.ownerSensorsWithData;
     const shell = formatPointForSensor({
       sensor_id: sid,
-      geo: hasValidCoordinates(geo) ? geo : null,
+      geo: hasValidCoordinates(geo) ? geo : keepBundle && hasValidCoordinates(prev?.geo) ? prev.geo : null,
       model: rawPoint?.model || prev?.model || DEFAULT_SENSOR_MODEL,
-      device_model: rawPoint?.device_model ?? prev?.device_model ?? null,
+      device_model: rawPoint?.device_model ?? (sameSensor ? prev?.device_model : null) ?? null,
       owner:
         rawPoint?.owner ||
-        prev?.owner ||
+        (keepBundle ? prev?.owner : null) ||
         (route.query.owner ? String(route.query.owner) : null),
-      address: rawPoint?.address || prev?.address || null,
-      data: rawPoint?.data || prev?.data || {},
-      maxdata: rawPoint?.maxdata || prev?.maxdata || {},
+      address: rawPoint?.address || (sameSensor ? prev?.address : null) || null,
+      data: rawPoint?.data || (sameSensor ? prev?.data : null) || {},
+      maxdata: rawPoint?.maxdata || (sameSensor ? prev?.maxdata : null) || {},
       logs,
       ownerSensorsWithData:
-        rawPoint?.ownerSensorsWithData ||
-        (sameSensor ? prev?.ownerSensorsWithData : null) ||
-        null,
+        mergedBundle?.length
+          ? mergedBundle
+          : rawPoint?.ownerSensorsWithData ||
+            (keepBundle || sameSensor ? prev?.ownerSensorsWithData : null) ||
+            null,
       ownerSensorIds:
-        rawPoint?.ownerSensorIds || (sameSensor ? prev?.ownerSensorIds : null) || null,
-      idbSensorType: rawPoint?.idbSensorType ?? (sameSensor ? prev?.idbSensorType : null) ?? null,
+        rawPoint?.ownerSensorIds ||
+        (keepBundle || sameSensor ? prev?.ownerSensorIds : null) ||
+        null,
+      idbSensorType:
+        rawPoint?.idbSensorType ?? (sameSensor ? prev?.idbSensorType : null) ?? null,
       _ownerResolved:
-        rawPoint?._ownerResolved ?? (sameSensor ? prev?._ownerResolved : false) ?? false,
+        rawPoint?._ownerResolved ??
+        ((keepBundle || sameSensor) && prev?._ownerResolved) ??
+        false,
+      proto: rawPoint?.proto === true || (sameSensor && prev?.proto === true) || historyHasProto(sid),
     });
 
     if (mapState.currentProvider.value === "realtime") {
@@ -1195,6 +1227,34 @@ export function useSensors() {
     return true;
   };
 
+  /** Keep Urban+Insight picker rows when RoSeMAN recap only lists one of them. */
+  const inheritOwnerBundle = (point, prev) => {
+    if (!point || !prev) return point;
+    const sameId = idsEq(prev.sensor_id, point.sensor_id);
+    const prevOwner = normalizeOwnerKey(prev);
+    const pointOwner = normalizeOwnerKey(point);
+    const sameOwner = Boolean(prevOwner) && (!pointOwner || pointOwner === prevOwner);
+    if (!sameId && !sameOwner) return point;
+
+    if (!point.owner && prev.owner) point.owner = prev.owner;
+    const merged = mergeOwnerBundleOptions(point.ownerSensorsWithData, prev.ownerSensorsWithData);
+    if (merged?.length) {
+      point.ownerSensorsWithData = merged;
+    } else if (!point.ownerSensorsWithData?.length && prev.ownerSensorsWithData?.length) {
+      point.ownerSensorsWithData = prev.ownerSensorsWithData;
+    }
+    if (!point.ownerSensorIds?.length && prev.ownerSensorIds?.length) {
+      point.ownerSensorIds = prev.ownerSensorIds;
+    }
+    if (!point.device_model) {
+      const entry = (point.ownerSensorsWithData || []).find((o) => idsEq(o?.id, point.sensor_id));
+      if (entry?.device_model) point.device_model = entry.device_model;
+      else if (entry?.type === "insight" || entry?.type === "urban") point.device_model = entry.type;
+      else if (sameId && prev.device_model) point.device_model = prev.device_model;
+    }
+    return point;
+  };
+
   /**
    * Open or refresh the sensor popup (bundle, logs, map click unit routing).
    * @param {Object} point - Sensor row or partial popup data
@@ -1207,20 +1267,17 @@ export function useSensors() {
    * @param {boolean} [options.fromMapClick] - Opened from map marker click
    */
   const updateSensorPopup = async (point, options = {}) => {
-
-
     if (!point.sensor_id) {
       return;
     }
+
+    point = inheritOwnerBundle({ ...point }, sensorPoint.value);
 
     // Re-check after every await — user may have closed popup while we waited
     const isStalePopupUpdate = () => {
       if (route.query.sensor && route.query.sensor !== point.sensor_id) return true;
       const closed = recentlyClosed.value;
-      // Recently closed: URL may still show old sensor id briefly
-      return (
-        closed?.id === point.sensor_id && Date.now() < (closed.until || 0)
-      );
+      return closed?.id === point.sensor_id && Date.now() < (closed.until || 0);
     };
 
     if (isStalePopupUpdate()) {
@@ -1233,26 +1290,45 @@ export function useSensors() {
         (sensorPoint.value?.sensor_id && !options.fromMapClick ? sensorPoint.value.sensor_id : "") ||
         ""
     ).trim();
-    if (lockedSensorId && lockedSensorId !== String(point.sensor_id) && !options.fromMapClick) {
-      const lockedRow = sensors.value.find((s) => String(s?.sensor_id || "") === lockedSensorId);
-      point = {
-        ...point,
-        sensor_id: lockedSensorId,
-        ...(lockedRow?.owner ? { owner: lockedRow.owner } : null),
-        ...(lockedRow?.geo ? { geo: lockedRow.geo } : null),
-        ...(lockedRow?.device_model ? { device_model: lockedRow.device_model } : null),
-      };
+    if (lockedSensorId && !idsEq(lockedSensorId, point.sensor_id) && !options.fromMapClick) {
+      const lockedRow = sensors.value.find((s) => idsEq(s?.sensor_id, lockedSensorId));
+      const lockedPopup =
+        sensorPoint.value && idsEq(sensorPoint.value.sensor_id, lockedSensorId)
+          ? sensorPoint.value
+          : null;
+      point = inheritOwnerBundle(
+        {
+          ...point,
+          sensor_id: lockedSensorId,
+          ...(lockedRow?.owner || lockedPopup?.owner
+            ? { owner: lockedRow?.owner || lockedPopup.owner }
+            : null),
+          ...(lockedRow?.geo || lockedPopup?.geo
+            ? { geo: lockedRow?.geo || lockedPopup.geo }
+            : null),
+          ...(lockedRow?.device_model || lockedPopup?.device_model
+            ? { device_model: lockedRow?.device_model || lockedPopup.device_model }
+            : null),
+          ...(lockedPopup?.idbSensorType ? { idbSensorType: lockedPopup.idbSensorType } : null),
+          proto: lockedRow?.proto === true || lockedPopup?.proto === true || point.proto === true,
+        },
+        sensorPoint.value
+      );
     }
 
-    // If URL no longer points to this sensor (e.g. popup was closed),
-    // don't reopen it from stale async updates.
-    // Map marker clicks pass `fromMapClick: true` so a stale `sensor=` in URL
-    // (e.g. after switching device in select) does not block opening the clicked marker.
     if (!options.fromMapClick && route.query.sensor && route.query.sensor !== point.sensor_id) {
       return;
     }
 
+    // Show the other bundle device immediately — recap owner/meta APIs can take seconds.
+    commitPopupShell(point);
+
+    if (isStalePopupUpdate()) {
+      return;
+    }
+
     const idbMeta = await getCachedSensorIdbMeta(point.sensor_id);
+    if (isStalePopupUpdate()) return;
     if (idbMeta) {
       point = mergePointWithIdbMeta(point, idbMeta);
     }
@@ -1261,25 +1337,29 @@ export function useSensors() {
       point.owner = String(route.query.owner);
     }
 
-    const ownerKey = await resolveOwnerKeyForSensor(point.sensor_id, point);
+    const ownerKey =
+      normalizeOwnerKey(point) || (await resolveOwnerKeyForSensor(point.sensor_id, point));
+    if (isStalePopupUpdate()) return;
     if (ownerKey) {
       point.owner = ownerKey;
-      if (!point.ownerSensorsWithData?.length) {
+      if (!ownerBundleHasPair(point.ownerSensorsWithData)) {
         const ids = await ensureOwnerSensorIds(
           { ...point, owner: ownerKey },
           ownerKey,
-          null,
+          point.ownerSensorIds || null,
           sensors.value
         );
+        if (isStalePopupUpdate()) return;
         const fullBundle = await buildOwnerSensorsWithDataAsync(
           { ...point, owner: ownerKey, ownerSensorIds: ids },
           sensors.value,
           ids,
           ownerBundleClustered()
         );
+        if (isStalePopupUpdate()) return;
         const anchorGeo = resolveBundleAnchorGeo(point, sensors.value);
         const bundleOpts = finalizeOwnerBundleNearAnchor(
-          fullBundle,
+          mergeOwnerBundleOptions(fullBundle, point.ownerSensorsWithData),
           anchorGeo,
           point.sensor_id,
           ownerBundleClustered()
@@ -1306,6 +1386,7 @@ export function useSensors() {
         point = {
           ...point,
           sensor_id: pickedId,
+          proto: row?.proto === true || point.proto === true,
           ...(row?.device_model ? { device_model: row.device_model } : null),
           geo: point.geo || row?.geo,
           sensors: point.sensors || row?.sensors || null,
@@ -1327,6 +1408,10 @@ export function useSensors() {
 
     // Marker clicks must always win; other callers can wait for the in-flight enrich pass.
     if (isUpdatingPopup.value && !options.fromMapClick) {
+      void nextTick(() => {
+        if (!isSensorOpen(point.sensor_id)) return;
+        void updateSensorLogs(point.sensor_id);
+      });
       return;
     }
 
@@ -1376,6 +1461,12 @@ export function useSensors() {
           ...prev,
           ...next,
           owner: next.owner || prev.owner,
+          device_model: next.device_model || prev.device_model,
+          proto: next.proto === true || prev.proto === true,
+          protoPrivate:
+            next.protoPrivate === null
+              ? null
+              : next.protoPrivate || prev.protoPrivate || null,
           ownerSensorIds: next.ownerSensorIds || prev.ownerSensorIds || null,
           idbSensorType: next.idbSensorType || prev.idbSensorType || null,
           geo: next.geo || prev.geo,
@@ -1483,6 +1574,12 @@ export function useSensors() {
           if (!point.owner && prevOpen.owner) {
             point.owner = prevOpen.owner;
           }
+          if (!point.device_model && prevOpen.device_model) {
+            point.device_model = prevOpen.device_model;
+          }
+          if (!point.idbSensorType && prevOpen.idbSensorType) {
+            point.idbSensorType = prevOpen.idbSensorType;
+          }
           if (
             !point.ownerSensorsWithData &&
             prevOpen.ownerSensorsWithData &&
@@ -1556,7 +1653,11 @@ export function useSensors() {
         sensorPoint.value?._logsKey === logsContextKey &&
         Array.isArray(currentLogs);
 
-      if (ownerKey && sensorPoint.value?.sensor_id) {
+      if (
+        ownerKey &&
+        sensorPoint.value?.sensor_id &&
+        !ownerBundleHasPair(sensorPoint.value.ownerSensorsWithData)
+      ) {
         void hydrateOwnerBundleFromUserSensors(sensorPoint.value.sensor_id, session);
       }
 
@@ -1615,24 +1716,50 @@ export function useSensors() {
       basePoint.ownerSensorIds ??
       (ownerKey ? peekUserSensorsCache(ownerKey) : null);
 
+    const sensorsFromMeta = (() => {
+      if (Array.isArray(basePoint.sensors) && basePoint.sensors.length > 0) {
+        return basePoint.sensors;
+      }
+      const meta = getCachedSensorMeta(
+        canonicalSensorId(basePoint.sensor_id) || basePoint.sensor_id
+      );
+      const entries = meta ? listBundleSensorEntries(meta) : [];
+      return entries.length > 0 ? entries : null;
+    })();
+
     const markerIcon = mapMarkerIcon(
-      { ...basePoint, ownerSensorsWithData, ownerSensorIds },
+      { ...basePoint, ownerSensorsWithData, ownerSensorIds, sensors: sensorsFromMeta },
       sensors.value,
       mapState.currentDate.value
     );
 
+    const selfBundle = Array.isArray(ownerSensorsWithData)
+      ? ownerSensorsWithData.find((o) => idsEq(o?.id || o?.sensor_id, basePoint.sensor_id))
+      : null;
+
     const point = {
-      sensor_id: basePoint.sensor_id,
+      sensor_id: canonicalSensorId(basePoint.sensor_id) || basePoint.sensor_id,
       geo: basePoint.geo,
       model: basePoint.model || DEFAULT_SENSOR_MODEL,
-      device_model: basePoint.device_model || null,
+      device_model:
+        basePoint.device_model ||
+        selfBundle?.device_model ||
+        (selfBundle?.type === "insight" || selfBundle?.type === "urban" ? selfBundle.type : null) ||
+        null,
       maxdata: basePoint.maxdata || {},
-      data: basePoint.data || {},
+      data: sanitizePmFieldsInData(basePoint.data || {}) || {},
       address: basePoint.address || null,
       owner: basePoint.owner || null,
-      sensors: Array.isArray(basePoint.sensors) ? basePoint.sensors : null,
+      sensors: sensorsFromMeta,
       idbSensorType: basePoint.idbSensorType ?? null,
       timestamp: basePoint.timestamp ?? null,
+      proto:
+        basePoint.proto === true ||
+        sensors.value?.some(
+          (s) => idsEq(s?.sensor_id, basePoint.sensor_id) && s.proto === true
+        ) ||
+        historyHasProto(basePoint.sensor_id),
+      protoPrivate: Array.isArray(basePoint.protoPrivate) ? basePoint.protoPrivate : null,
       ownerSensorsWithData,
       ownerSensorIds,
       isBookmarked: isPointBookmarked(basePoint),
@@ -1656,18 +1783,19 @@ export function useSensors() {
 
   const readMarkerUnitValue = (p) => {
     const currentUnit = mapState.currentUnit.value;
-    const bag =
-      mapState.currentProvider.value === "remote" ? p?.maxdata : p?.data;
-    const value = unitValueFromBag(bag, currentUnit);
+    const isRemote = mapState.currentProvider.value === "remote";
+    const primary = isRemote ? p?.maxdata : p?.data;
+    let value = unitValueFromBag(primary, currentUnit);
+    if (value === null && isRemote) {
+      value = unitValueFromBag(p?.data, currentUnit);
+    }
     if (value !== null) return { value, isEmpty: false };
     return { value: null, isEmpty: true };
   };
 
   const mergeSensorWithList = (p) => {
     if (!p?.sensor_id) return p;
-    const row = sensors.value?.find(
-      (s) => String(s?.sensor_id || "") === String(p.sensor_id)
-    );
+    const row = sensors.value?.find((s) => idsEq(s?.sensor_id, p.sensor_id));
     if (!row) return p;
     return {
       ...row,
@@ -1753,10 +1881,8 @@ export function useSensors() {
 
     const openRep = isOpenOwnerClusterRep(point);
 
-    if (currentUnit === "co2" || mapState.currentProvider.value === "realtime") {
-      const clusterMax = maxValueInOwnerCluster(point);
-      if (clusterMax !== null) return { value: clusterMax, isEmpty: false };
-    }
+    const clusterMax = maxValueInOwnerCluster(point);
+    if (clusterMax !== null) return { value: clusterMax, isEmpty: false };
 
     if (!openRep) return direct;
 
@@ -1781,8 +1907,8 @@ export function useSensors() {
     const logMax = maxFromLogs(open.logs, currentUnit);
     if (logMax !== null) return { value: logMax, isEmpty: false };
 
-    const clusterMax = maxValueInOwnerCluster(open);
-    if (clusterMax !== null) return { value: clusterMax, isEmpty: false };
+    const openClusterMax = maxValueInOwnerCluster(open);
+    if (openClusterMax !== null) return { value: openClusterMax, isEmpty: false };
 
     return { value: null, isEmpty: true };
   };
@@ -1798,15 +1924,11 @@ export function useSensors() {
     }
 
     const { mode, sensors: configSensors } = excluded_sensors;
-    const sensorIdsSet = new Set(configSensors);
 
     if (mode === "include-only") {
-      // include-only: hide ids not in the list
-      return !sensorIdsSet.has(sensorId);
-    } else {
-      // exclude: hide ids in the list
-      return sensorIdsSet.has(sensorId);
+      return !configSensors.includes(sensorId);
     }
+    return configSensors.includes(sensorId);
   };
 
   const collectHeaderSensorIds = (lists) => {
@@ -1885,7 +2007,9 @@ export function useSensors() {
     if (!ownerKey) return;
     rebundleOwnerMarkers(ownerKey, resolveBundleAnchorGeo(point, sensors.value));
     if (highlight && sensorPoint.value?.sensor_id && isSensorOpen(point.sensor_id)) {
-      setActiveMarker(resolveOwnerClusterMarkerId(sensorPoint.value.sensor_id));
+      setActiveMarker(resolveOwnerClusterMarkerId(sensorPoint.value.sensor_id), "sensor", {
+        center: false,
+      });
     }
   };
 
@@ -1946,9 +2070,21 @@ export function useSensors() {
           ...(Array.isArray(cachedIds) ? cachedIds.map((id) => String(id)) : []),
         ]),
       ];
-      const typed = inferTypesForOwnerIds(memberIds, list, rep);
+      const prevBundle =
+        (sensorPoint.value && normalizeOwnerKey(sensorPoint.value) === ownerKey
+          ? sensorPoint.value.ownerSensorsWithData
+          : null) ||
+        rep.ownerSensorsWithData ||
+        null;
+      const typed = inferTypesForOwnerIds(memberIds, list, {
+        ...rep,
+        ownerSensorsWithData: prevBundle,
+      });
       const clusterBundle = finalizeOwnerBundleNearAnchor(
-        buildOwnerBundleFromIds(memberIds, list, repId, rep, typed),
+        mergeOwnerBundleOptions(
+          buildOwnerBundleFromIds(memberIds, list, repId, { ...rep, ownerSensorsWithData: prevBundle }, typed),
+          prevBundle
+        ),
         clusterAnchor,
         repId
       );
@@ -1968,11 +2104,29 @@ export function useSensors() {
 
       for (const s of members) {
         const sid = String(s?.sensor_id || "");
-        if (sid && sid !== repId) sensorsUtils.removeMarker(sid);
+        if (sid && !idsEq(sid, repId)) sensorsUtils.removeMarker(sid);
       }
 
       if (shouldFilterSensor(repId)) {
         sensorsUtils.removeMarker(repId);
+      }
+
+      if (
+        hasSensorOwner(rep) &&
+        repId &&
+        !getCachedSensorMeta(repId) &&
+        !bundleIconMetaInflight.has(repId)
+      ) {
+        bundleIconMetaInflight.add(repId);
+        const { start, end } = sensorFetchBoundsForDate(dayISO());
+        const refreshOwner = ownerKey;
+        void preloadSensorMeta(repId, start, end)
+          .catch(() => null)
+          .then((meta) => {
+            bundleIconMetaInflight.delete(repId);
+            if (!meta || !sensorsUtils.isReadyLayer()) return;
+            rebundleOwnerMarkers(refreshOwner || normalizeOwnerKey(meta));
+          });
       }
     };
 
@@ -2029,6 +2183,7 @@ export function useSensors() {
    * @param {Object} point.maxdata - Daily recap values
    */
   const updateSensorMarker = (point) => {
+    if (!point?.sensor_id || !sensorsUtils.isReadyLayer()) return;
 
     // excluded_sensors config
     if (shouldFilterSensor(point.sensor_id)) {
@@ -2050,7 +2205,7 @@ export function useSensors() {
           const bundleOpts =
             applyFilteredOwnerBundleOptions(
               sensorPoint.value,
-              null,
+              sensorPoint.value.ownerSensorsWithData,
               sensors.value,
               ownerBundleClustered()
             ) ||
@@ -2205,7 +2360,7 @@ export function useSensors() {
       ownerBundleClustered()
     );
     const bundleOpts = finalizeOwnerBundleNearAnchor(
-      fullBundle,
+      mergeOwnerBundleOptions(fullBundle, point?.ownerSensorsWithData),
       anchorGeo,
       sid,
       ownerBundleClustered()
@@ -2228,14 +2383,16 @@ export function useSensors() {
       for (const o of bundleOpts) {
         if (!o.hasData || !hasValidCoordinates(o.geo)) continue;
         const id = String(o.id);
-        if (next.some((s) => String(s?.sensor_id || "") === id)) continue;
+        if (next.some((s) => idsEq(s?.sensor_id, id))) continue;
         next.push(
           formatPointForSensor(
             {
               sensor_id: id,
               geo: o.geo,
               owner: ownerKey,
-              device_model: o.device_model || null,
+              device_model:
+                o.device_model ||
+                (o.type === "insight" || o.type === "urban" ? o.type : null),
               model: DEFAULT_SENSOR_MODEL,
               timestamp: Math.floor(Date.now() / 1000),
             },
@@ -2389,11 +2546,35 @@ export function useSensors() {
   const switchOpenSensor = (nextId, point = sensorPoint.value) => {
     const next = String(nextId || "").trim();
     const current = String(point?.sensor_id || "");
-    if (!next || next === current) return;
+    if (!next || idsEq(next, current)) return;
 
-    const sensorsList = sensors.value || [];
-    const nextRow = sensorsList.find((s) => String(s?.sensor_id || "") === next);
+    const nextEntry = Array.isArray(point?.ownerSensorsWithData)
+      ? point.ownerSensorsWithData.find((o) => idsEq(o?.id, next))
+      : null;
+    const nextRow = (sensors.value || []).find((s) => idsEq(s?.sensor_id, next));
     const nextOwner = nextRow?.owner || point?.owner || null;
+    const nextType = nextEntry?.type || nextEntry?.device_model || null;
+    const nextModel =
+      nextEntry?.device_model ||
+      (nextType === "insight" || nextType === "urban" ? nextType : null) ||
+      null;
+
+    commitPopupShell({
+      sensor_id: next,
+      owner: nextOwner,
+      geo:
+        (nextEntry?.geo && hasValidCoordinates(nextEntry.geo) ? nextEntry.geo : null) ||
+        (nextRow?.geo && hasValidCoordinates(nextRow.geo) ? nextRow.geo : null) ||
+        point?.geo,
+      device_model: nextModel,
+      idbSensorType: nextType === "insight" || nextType === "urban" ? nextType : null,
+      ownerSensorsWithData: point?.ownerSensorsWithData || null,
+      ownerSensorIds: point?.ownerSensorIds || null,
+      proto: nextEntry?.proto === true || nextRow?.proto === true,
+      logs: null,
+      data: {},
+      maxdata: nextRow?.maxdata || {},
+    });
 
     mapState.setMapSettings(route, router, {
       lat: point?.geo?.lat ?? route.query.lat,
@@ -2403,48 +2584,10 @@ export function useSensors() {
       owner: nextOwner ? String(nextOwner) : undefined,
     });
 
-    clearSensorLogs();
-
-    void ensureOwnerLoaded(next);
-    void (async () => {
-      if (!sensorPoint.value) return;
-      const ownerKey = String(nextOwner || sensorPoint.value?.owner || route.query.owner || "").trim();
-      if (!ownerKey) return;
-
-      await hydrateOwnerBundleFromUserSensors(next);
-      if (mapState.currentProvider.value === "realtime") {
-        refreshOpenSensorMapMarker();
-        return;
-      }
-
-      const anchorGeo =
-        resolveBundleAnchorGeo(
-          {
-            sensor_id: next,
-            geo: point?.geo || sensorPoint.value?.geo || nextRow?.geo,
-          },
-          sensorsList
-        ) ||
-        point?.geo ||
-        sensorPoint.value?.geo ||
-        null;
-
-      const nextPoint = {
-        ...point,
-        sensor_id: next,
-        owner: ownerKey,
-        geo: anchorGeo,
-        ownerSensorIds: sensorPoint.value?.ownerSensorIds || point?.ownerSensorIds || null,
-      };
-      const fullBundle = buildOwnerSensorsWithData(nextPoint, sensorsList, null, ownerBundleClustered());
-      const bundleOpts =
-        finalizeOwnerBundleNearAnchor(fullBundle, anchorGeo, next, ownerBundleClustered()) ||
-        point?.ownerSensorsWithData;
-      rebundleOwnerClusterForPoint({
-        ...nextPoint,
-        ownerSensorsWithData: bundleOpts,
-      });
-    })();
+    void updateSensorLogs(next);
+    if (mapState.currentProvider.value === "realtime") {
+      refreshOpenSensorMapMarker();
+    }
   };
 
   // --- Watchers ---
@@ -2478,7 +2621,9 @@ export function useSensors() {
           .sort()
           .join("|");
         const needsDecrypt =
-          measurementBagHasEncryptedValues(popup?.data) || logHasEncryptedValues(popup?.logs);
+          measurementBagHasEncryptedValues(popup?.data) ||
+          logHasEncryptedValues(popup?.logs) ||
+          hasPendingProtoPrivate(popup);
         return `${mapState.currentProvider.value}|${sid}|${owner}|${popup?._ownerResolved ? "1" : "0"}|${accountsUnlockKey}|${needsDecrypt}|${popup?.logs?.length || 0}`;
       },
       () => {

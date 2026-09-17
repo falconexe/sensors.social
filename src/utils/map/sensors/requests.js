@@ -6,6 +6,8 @@ import { dayISO, dayBoundsUnix, timelineFetchBounds } from "../../date";
 import { mapLayerUnitIds, sortMapLayerUnits } from "../../../measurements/tools";
 import { settings, excluded_sensors } from "@config";
 import { decryptMeasurementBag } from "@/utils/sensorValueCrypto";
+import { decodeSignedEnvelopeBatchToPoints, decryptProtoPrivate } from "@/utils/proto/decodeEnvelope";
+import { canonicalSensorId, sensorIdToHex, sensorIdToSs58 } from "@/utils/sensorId";
 
 // Глобальные константы провайдеров
 const REMOTE_PROVIDER = new Provider(settings.REMOTE_PROVIDER);
@@ -57,14 +59,16 @@ async function decryptSensorHistoryEntries(sensorId, entries, ownerAddress) {
 
   return Promise.all(
     entries.map(async (entry) => {
-      if (!entry?.data || typeof entry.data !== "object") return entry;
-      const data = await decryptMeasurementBag(sensorId, entry.data, ownerAccount);
-      return data === entry.data ? entry : { ...entry, data };
+      let next = entry;
+      if (Array.isArray(entry?.protoPrivate) && entry.protoPrivate.length > 0) {
+        next = await decryptProtoPrivate(entry, ownerAccount);
+      }
+      if (!next?.data || typeof next.data !== "object") return next;
+      const data = await decryptMeasurementBag(sensorId, next.data, ownerAccount);
+      return data === next.data ? next : { ...next, data };
     })
   );
 }
-
-
 
 /**
  * Day fetch bounds aligned with getSensorDataWithCache: for today end = now, not end-of-day.
@@ -74,7 +78,7 @@ export function sensorFetchBoundsForDate(isoDate) {
 }
 
 async function fetchSensorV2Payload(sensorId, startTimestamp, endTimestamp, signal = null) {
-  const sid = String(sensorId || "");
+  const sid = sensorIdToHex(sensorId) || String(sensorId || "").trim();
   if (!sid) return null;
 
   const key = `${sid}:${startTimestamp}:${endTimestamp}`;
@@ -101,6 +105,123 @@ async function fetchSensorV2Payload(sensorId, startTimestamp, endTimestamp, sign
 
   sensorV2Inflight.set(key, promise);
   return promise;
+}
+
+export { canonicalSensorId, sensorIdToHex, sensorIdToSs58 } from "@/utils/sensorId";
+
+function unixToMs(ts) {
+  const n = Number(ts);
+  if (!Number.isFinite(n) || n <= 0) return NaN;
+  return n < 1e12 ? Math.trunc(n * 1000) : Math.trunc(n);
+}
+
+/** v3 ranges are `[start, end)` in milliseconds; v2 sensor ranges are inclusive seconds. */
+function unixToExclusiveEndMs(ts) {
+  const n = Number(ts);
+  if (!Number.isFinite(n) || n <= 0) return NaN;
+  return n < 1e12 ? Math.trunc(n + 1) * 1000 : Math.trunc(n) + 1;
+}
+
+function protoPointsToHistory(points) {
+  if (!Array.isArray(points) || points.length === 0) return [];
+  return points
+    .map((point) => {
+      const ts = Number(point?.timestamp);
+      if (!Number.isFinite(ts) || !point?.data || typeof point.data !== "object") return null;
+      const entry = { timestamp: ts, data: point.data, proto: true };
+      if (point.device_model) entry.device_model = point.device_model;
+      if (point.owner) entry.owner = point.owner;
+      if (
+        point.geo &&
+        Number.isFinite(Number(point.geo.lat)) &&
+        Number.isFinite(Number(point.geo.lng))
+      ) {
+        entry.geo = point.geo;
+      }
+      if (Array.isArray(point.protoPrivate) && point.protoPrivate.length > 0) {
+        entry.protoPrivate = point.protoPrivate;
+      }
+      return entry;
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.timestamp - b.timestamp);
+}
+
+let rosemanV3MessagesSupported = true;
+const ROSEMAN_V3_LATEST_MAX_MS = 24 * 60 * 60 * 1000;
+
+function rosemanV3Url(path, params) {
+  const base = String(settings.REMOTE_PROVIDER || "").replace(/\/?$/, "/");
+  return `${base}${path}?${params}`;
+}
+
+/**
+ * Binary `SignedEnvelopeBatch` from RoSeMAN. Only verified envelopes become points.
+ * @returns {{ points: object[], cursor: string }|null} null if aborted
+ */
+async function fetchRosemanV3ProtobufPoints(path, params, signal = null) {
+  if (!rosemanV3MessagesSupported) return { points: [], cursor: "" };
+  try {
+    if (signal?.aborted) return null;
+    const res = await fetch(rosemanV3Url(path, params), {
+      credentials: "omit",
+      cache: "no-store",
+      signal,
+    });
+    if (res.status === 404) {
+      rosemanV3MessagesSupported = false;
+      return { points: [], cursor: "" };
+    }
+    if (!res.ok) return { points: [], cursor: "" };
+    const buf = new Uint8Array(await res.arrayBuffer());
+    return {
+      points:
+        buf.byteLength > 0
+          ? decodeSignedEnvelopeBatchToPoints(buf, { requireGeo: false, verbose: false })
+          : [],
+      cursor: res.headers.get("X-Next-Cursor") || "",
+    };
+  } catch (error) {
+    if (error?.name === "AbortError" || signal?.aborted) return null;
+    return { points: [], cursor: "" };
+  }
+}
+
+/**
+ * Day/week/month chart history from RoSeMAN protobuf (`SignedEnvelopeBatch`).
+ * Empty / 404 / decode-miss falls through to v2 JSON in getSensorData.
+ */
+async function fetchSensorV3ProtobufLogs(
+  sensorId,
+  startTimestamp,
+  endTimestamp,
+  signal = null
+) {
+  const hex = sensorIdToHex(sensorId);
+  if (!hex) return [];
+  const startMs = unixToMs(startTimestamp);
+  const endMs = unixToExclusiveEndMs(endTimestamp);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs >= endMs) return [];
+
+  const points = [];
+  let cursor = "";
+
+  for (let page = 0; page < 32; page++) {
+    const params = new URLSearchParams({
+      start: String(startMs),
+      end: String(endMs),
+      limit: "1000",
+      sensor_id: hex,
+    });
+    if (cursor) params.set("cursor", cursor);
+    const pageResult = await fetchRosemanV3ProtobufPoints("api/v3/messages", params, signal);
+    if (pageResult === null) return null;
+    points.push(...pageResult.points);
+    cursor = pageResult.cursor;
+    if (!cursor) break;
+  }
+
+  return protoPointsToHistory(points);
 }
 
 // Cache latest v2 meta for a sensor to drive UI (owner sensors dropdown, etc.)
@@ -136,11 +257,11 @@ export function hasSensorOwner(item) {
 export function parseBundleSensorEntry(entry) {
   if (entry == null) return null;
   if (typeof entry === "string" || typeof entry === "number") {
-    const sensor_id = String(entry).trim();
+    const sensor_id = canonicalSensorId(entry);
     return sensor_id ? { sensor_id, device_model: null } : null;
   }
   if (typeof entry === "object") {
-    const sensor_id = String(entry.sensor_id || entry.id || "").trim();
+    const sensor_id = canonicalSensorId(entry.sensor_id || entry.id);
     if (!sensor_id) return null;
     const dm = entry.device_model ?? entry.model ?? null;
     return {
@@ -160,9 +281,18 @@ export function sensorTypeFromDeviceModel(deviceModel) {
   return null;
 }
 
+/** True for a real log metric: number or JSON `e.` ciphertext, not proto `e.proto` placeholders. */
+function logValueIsRealMeasurement(value) {
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "string") return false;
+  if (value === "e.proto") return false;
+  return value.startsWith("e.") && value.length > 2;
+}
+
 /**
  * Infer Urban vs Insight when Roseman omits device_model on bundle entries.
  * Insight: CO₂ without PM; Urban: PM and/or noise metrics.
+ * Synthetic proto placeholders (`e.proto`) must not flip Insight → Urban.
  */
 export function inferDeviceTypeFromLog(log) {
   if (!Array.isArray(log) || log.length === 0) return null;
@@ -172,7 +302,8 @@ export function inferDeviceTypeFromLog(log) {
   for (const item of sample) {
     const data = item?.data;
     if (!data || typeof data !== "object") continue;
-    for (const key of Object.keys(data)) {
+    for (const [key, value] of Object.entries(data)) {
+      if (!logValueIsRealMeasurement(value)) continue;
       keys.add(String(key).toLowerCase());
     }
   }
@@ -472,14 +603,25 @@ function isMaxDataMemoryValid(cached, isoDate, dayStart) {
 }
 
 function applyMaxValuesToSensors(sensors, unit, maxValues) {
+  const u = String(unit || "").toLowerCase();
   return sensors.map((sensor) => {
-    const entry = maxValues?.[sensor.sensor_id];
-    const value = entry ? (entry.value ?? null) : null;
+    const sid = String(sensor?.sensor_id || "");
+    const entry =
+      maxValues?.[sid] ||
+      maxValues?.[canonicalSensorId(sid)] ||
+      null;
+    const apiNum =
+      entry && entry.value != null && Number.isFinite(Number(entry.value))
+        ? Number(entry.value)
+        : null;
+    const prev = sensor?.maxdata?.[u];
+    const prevNum = typeof prev === "number" && Number.isFinite(prev) ? prev : null;
+    const value = apiNum != null ? apiNum : prevNum;
     return {
       ...sensor,
       maxdata: {
         ...sensor.maxdata,
-        [unit]: value,
+        [u]: value,
       },
     };
   });
@@ -643,17 +785,60 @@ export function maxdataHasMapGeo(values) {
 /** @deprecated use sortMapLayerUnits from measurements/tools */
 export const sortMeasurementUnits = sortMapLayerUnits;
 
-/** Collect measurement keys from sensors that are drawable on the map (realtime). */
+const URBAN_FOOTER_UNITS = [
+  "pm10",
+  "pm25",
+  "temperature",
+  "humidity",
+  "pressure",
+  "noisemax",
+  "noiseavg",
+];
+const INSIGHT_FOOTER_UNITS = ["temperature", "humidity", "pressure", "co2"];
+
+function addDeviceFooterTypes(sensor, types) {
+  const add = (model) => {
+    const t = sensorTypeFromDeviceModel(model);
+    if (t === "insight") types.add("insight");
+    if (t === "urban" || t === "altruist") types.add("urban");
+  };
+  add(sensor?.device_model);
+  add(sensor?.idbSensorType);
+  for (const row of Array.isArray(sensor?.ownerSensorsWithData) ? sensor.ownerSensorsWithData : []) {
+    add(row?.type || row?.device_model);
+  }
+  for (const entry of Array.isArray(sensor?.sensors) ? sensor.sensors : []) {
+    add(parseBundleSensorEntry(entry)?.device_model);
+  }
+}
+
+/** Measurement keys to offer in the footer: numeric, encrypted proto, and typical Urban/Insight set. */
 export function collectUnitsFromMapSensors(sensors) {
+  const allowed = new Set(mapLayerUnitIds());
   const units = new Set();
   for (const sensor of Array.isArray(sensors) ? sensors : []) {
     if (!hasValidCoordinates(sensor?.geo)) continue;
+    const types = new Set();
+    addDeviceFooterTypes(sensor, types);
+    if (sensor?.proto === true && types.size === 0) types.add("urban");
+    if (types.has("urban")) {
+      for (const unit of URBAN_FOOTER_UNITS) if (allowed.has(unit)) units.add(unit);
+    }
+    if (types.has("insight")) {
+      for (const unit of INSIGHT_FOOTER_UNITS) if (allowed.has(unit)) units.add(unit);
+    }
     for (const bag of [sensor?.data, sensor?.maxdata]) {
       if (!bag || typeof bag !== "object") continue;
       for (const [key, raw] of Object.entries(bag)) {
         const unit = String(key).toLowerCase();
-        if (!unit || raw === null || raw === undefined) continue;
-        units.add(unit);
+        if (!allowed.has(unit) || raw === null || raw === undefined) continue;
+        if (typeof raw === "number" && Number.isFinite(raw)) {
+          units.add(unit);
+          continue;
+        }
+        if (typeof raw === "string" && (raw.startsWith("e.") || Number.isFinite(Number(raw)))) {
+          units.add(unit);
+        }
       }
     }
   }
@@ -802,14 +987,15 @@ function markerRowsFromSensorData(historyData, { includeLiveData = false } = {})
     const lng = parseFloat(sensorData.geo.lng);
 
     const sensorInfo = {
-      sensor_id: sensorData.sensor_id,
+      sensor_id: canonicalSensorId(sensorData.sensor_id),
       model: sensorData.model || 2,
       geo: { lat, lng },
       address: sensorData.address || null,
       donated_by: sensorData.donated_by || null,
-      owner: String(sensorData.owner || "").trim() || null,
+      owner: normalizeOwnerKey(sensorData) || null,
       device_model: sensorData.device_model || null,
       timestamp: sensorData.timestamp || null,
+      proto: sensorData.proto === true,
       sensors:
         Array.isArray(sensorData.sensors) && sensorData.sensors.length > 0
           ? sensorData.sensors
@@ -857,7 +1043,126 @@ export async function getSensors(start, end, provider = "remote", cacheContext =
     ? await loadMarkersListRaw(start, end, cacheContext.isoDate, cacheContext.timelineMode)
     : await REMOTE_PROVIDER.getSensorsForPeriod(start, end);
 
-  return markerRowsFromSensorData(historyData);
+  const rows = markerRowsFromSensorData(historyData);
+  rows.sensors = await attachRosemanV3Proto(rows.sensors, start, end);
+  rows.sensorsNoLocation = await attachRosemanV3Proto(rows.sensorsNoLocation, start, end);
+  return rows;
+}
+
+function numericMeasurementBag(data) {
+  const out = {};
+  if (!data || typeof data !== "object") return out;
+  for (const [key, raw] of Object.entries(data)) {
+    const unit = String(key).toLowerCase();
+    if (!unit) continue;
+    if (typeof raw === "string" && raw.startsWith("e.")) continue;
+    const n = typeof raw === "number" ? raw : Number(raw);
+    if (Number.isFinite(n)) out[unit] = n;
+  }
+  return out;
+}
+
+function indexProtoLatestPoints(points) {
+  const byKey = new Map();
+  const remember = (key, point) => {
+    const id = String(key || "").trim();
+    if (!id) return;
+    const prev = byKey.get(id);
+    if (!prev || Number(point.timestamp || 0) >= Number(prev.timestamp || 0)) {
+      byKey.set(id, point);
+    }
+  };
+  for (const point of points) {
+    const sid = String(point?.sensor_id || "").trim();
+    if (!sid) continue;
+    remember(sid, point);
+    remember(canonicalSensorId(sid), point);
+    remember(sensorIdToHex(sid), point);
+    remember(sensorIdToSs58(sid), point);
+  }
+  return byKey;
+}
+
+function lookupProtoPoint(byKey, sensorId) {
+  const raw = String(sensorId || "").trim();
+  if (!raw) return null;
+  return (
+    byKey.get(raw) ||
+    byKey.get(canonicalSensorId(raw)) ||
+    byKey.get(sensorIdToHex(raw)) ||
+    byKey.get(sensorIdToSs58(raw)) ||
+    null
+  );
+}
+
+function mergeNumericMax(into, bag) {
+  for (const [unit, n] of Object.entries(bag || {})) {
+    const prev = into[unit];
+    if (typeof prev !== "number" || !Number.isFinite(prev) || n > prev) {
+      into[unit] = n;
+    }
+  }
+}
+
+async function attachRosemanV3Proto(sensors, start, end) {
+  if (!Array.isArray(sensors) || sensors.length === 0) return sensors;
+  const startMs = unixToMs(start);
+  const endMs = unixToExclusiveEndMs(end);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs >= endMs) {
+    return sensors;
+  }
+
+  const points = [];
+  try {
+    for (let chunkStart = startMs; chunkStart < endMs; chunkStart += ROSEMAN_V3_LATEST_MAX_MS) {
+      const chunkEnd = Math.min(chunkStart + ROSEMAN_V3_LATEST_MAX_MS, endMs);
+      if (chunkEnd <= chunkStart) break;
+      const params = new URLSearchParams({
+        start: String(chunkStart),
+        end: String(chunkEnd),
+      });
+      const page = await fetchRosemanV3ProtobufPoints("api/v3/messages/latest", params);
+      if (!page) break;
+      points.push(...page.points);
+      if (!rosemanV3MessagesSupported) break;
+    }
+  } catch {
+    return sensors;
+  }
+
+  if (points.length === 0) return sensors;
+
+  const byKey = indexProtoLatestPoints(points);
+
+  return sensors.map((sensor) => {
+    const own = lookupProtoPoint(byKey, sensor?.sensor_id);
+    const siblingPoints = own ? [own] : [];
+    for (const entry of Array.isArray(sensor?.sensors) ? sensor.sensors : []) {
+      const sid = parseBundleSensorEntry(entry)?.sensor_id;
+      const point = lookupProtoPoint(byKey, sid);
+      if (point && !siblingPoints.includes(point)) siblingPoints.push(point);
+    }
+    if (siblingPoints.length === 0) return sensor;
+
+    const nums = {};
+    for (const point of siblingPoints) {
+      mergeNumericMax(nums, numericMeasurementBag(point.data));
+    }
+    const maxdata = { ...(sensor.maxdata || {}) };
+    mergeNumericMax(maxdata, nums);
+    const latest = siblingPoints.reduce((a, b) =>
+      Number(b?.timestamp || 0) >= Number(a?.timestamp || 0) ? b : a
+    );
+
+    return {
+      ...sensor,
+      proto: true,
+      device_model: sensor.device_model || own?.device_model || null,
+      data: { ...(sensor.data || {}), ...nums },
+      maxdata,
+      timestamp: latest.timestamp || sensor.timestamp,
+    };
+  });
 }
 
 /**
@@ -1082,11 +1387,56 @@ export function filterOwnerBundleNearAnchor(items, anchorGeo, activeSensorId, ma
   const list = Array.isArray(items) ? items.filter(Boolean) : [];
   if (list.length === 0) return list;
 
+  const sid = String(activeSensorId || "");
   const withGeo = list.filter((o) => o?.geo && hasValidCoordinates(o.geo));
-  if (!anchorGeo || !hasValidCoordinates(anchorGeo)) {
-    return withGeo;
+  const nearby =
+    !anchorGeo || !hasValidCoordinates(anchorGeo)
+      ? withGeo
+      : withGeo.filter((o) => haversineKm(anchorGeo, o.geo) <= maxKm);
+
+  const nearbyIds = new Set(nearby.map((o) => String(o.id)));
+  const nearbyTypes = new Set(
+    nearby.map((o) => String(o?.type || "").toLowerCase()).filter(Boolean)
+  );
+  const declared = new Set();
+  if (sid) {
+    declared.add(sid);
+    const meta = getCachedSensorMeta(sid);
+    if (meta) {
+      for (const entry of listBundleSensorEntries(meta)) {
+        if (entry?.sensor_id) declared.add(String(entry.sensor_id));
+      }
+    }
   }
-  return withGeo.filter((o) => haversineKm(anchorGeo, o.geo) <= maxKm);
+  const extras = [];
+  const extraTypeUsed = new Set();
+  for (const o of list) {
+    const id = String(o?.id || "");
+    if (!id || nearbyIds.has(id)) continue;
+    const t = String(o?.type || o?.device_model || "").toLowerCase();
+    const isInsight = t === "insight";
+    const isUrban = t === "urban" || t === "altruist";
+    if (!isInsight && !isUrban) continue;
+    const pairType = isInsight ? "insight" : "urban";
+    if (extraTypeUsed.has(pairType)) continue;
+    const keepDeclared = declared.has(id);
+    const keepPair =
+      (isInsight && (nearbyTypes.has("urban") || nearbyTypes.has("altruist"))) ||
+      (isUrban && nearbyTypes.has("insight"));
+    if (!keepDeclared && !keepPair) continue;
+    if (o?.geo && hasValidCoordinates(o.geo) && hasValidCoordinates(anchorGeo)) {
+      if (haversineKm(anchorGeo, o.geo) > maxKm) continue;
+    }
+    extras.push(o);
+    extraTypeUsed.add(pairType);
+  }
+
+  let result = nearby;
+  if (sid && !result.some((o) => String(o.id) === sid)) {
+    const self = list.find((o) => String(o.id) === sid);
+    if (self) result = [self, ...result];
+  }
+  return extras.length ? [...result, ...extras] : result;
 }
 
 /**
@@ -1099,7 +1449,7 @@ export function collectOwnerDeviceIds(ownerKey, sensorsList) {
     ...new Set(
       (Array.isArray(sensorsList) ? sensorsList : [])
         .filter((s) => normalizeOwnerKey(s) === owner)
-        .map((s) => String(s?.sensor_id || ""))
+        .map((s) => String(s?.sensor_id || "").trim())
         .filter(Boolean)
     ),
   ];
@@ -1236,24 +1586,35 @@ export async function getSensorData(
         return Array.isArray(historyData) ? historyData : null;
       }
     } else {
-      const payload = await fetchSensorV2Payload(
-        sensorId,
-        startTimestamp,
-        endTimestamp,
-        signal
-      );
+      const [protoLogs, payload] = await Promise.all([
+        fetchSensorV3ProtobufLogs(sensorId, startTimestamp, endTimestamp, signal),
+        fetchSensorV2Payload(sensorId, startTimestamp, endTimestamp, signal).catch((error) => {
+          if (error?.name === "AbortError" || signal?.aborted) throw error;
+          return null;
+        }),
+      ]);
+      if (signal?.aborted) return null;
       if (payload?.sensor && typeof payload.sensor === "object") {
         cacheSensorMetaForBundle(sensorId, payload.sensor);
       } else if (payload != null) {
         // v2 responded without owner meta — avoid duplicate owner workaround fetch this session.
         rosemanOwnerWorkaroundCache.set(String(sensorId), { owner: null, ts: Date.now() });
       }
+      const owner =
+        normalizeOwnerKey(payload?.sensor) ||
+        (Array.isArray(protoLogs) ? normalizeOwnerKey(protoLogs[0]) : "") ||
+        normalizeOwnerKey(getCachedSensorMeta(sensorId));
+      if (Array.isArray(protoLogs) && protoLogs.length > 0) {
+        return owner
+          ? await decryptSensorHistoryEntries(sensorId, protoLogs, owner)
+          : protoLogs;
+      }
       let historyData = payload?.result;
-      const owner = normalizeOwnerKey(payload?.sensor);
       if (Array.isArray(historyData) && owner) {
         historyData = await decryptSensorHistoryEntries(sensorId, historyData, owner);
       }
-      // Если данных нет, возвращаем [] (загружено, но пусто), если null/undefined - null (не загружено)
+      // null protoLogs = aborted v3; otherwise fall back to v2 (or null if v2 also missing)
+      if (protoLogs === null && !Array.isArray(historyData)) return null;
       return Array.isArray(historyData) ? historyData : null;
     }
   } catch (error) {
@@ -1370,6 +1731,8 @@ export async function fetchSensorCities() {
 // ==================== INDEXEDDB CACHE FUNCTIONS ====================
 
 const SENSOR_IDB_TTL = 24 * 60 * 60 * 1000; // 24 hours
+/** Bump when log shape changes (proto history) so stale IDB day caches are ignored. */
+const SENSOR_LOG_CACHE_GEN = 4;
 
 function stripSensorCacheAddress(entry) {
   if (!entry || !("address" in entry)) return entry;
@@ -1437,14 +1800,18 @@ async function getCachedData(sensorId, dates) {
     const sensorData = await readSensorIdbEntry(sensorId);
 
     if (sensorData && isFreshSensorIdbEntry(sensorData)) {
-      for (const date of dates) {
-        if (sensorData.data && sensorData.data[date]) {
-          cachedData.data[date] = sensorData.data[date];
-        }
-      }
       cachedData.owner = sensorData.owner ?? null;
       cachedData.type = sensorData.type ?? null;
       cachedData.lastUpdated = Number(sensorData.lastUpdated || 0);
+      if (Number(sensorData.logCacheGen) === SENSOR_LOG_CACHE_GEN) {
+        for (const date of dates) {
+          if (sensorData.data && sensorData.data[date]) {
+            cachedData.data[date] = sensorData.data[date];
+          }
+        }
+      } else {
+        cachedData.lastUpdated = 0;
+      }
     }
 
     return cachedData;
@@ -1495,6 +1862,7 @@ async function saveToCache(sensorId, dataByDate, meta = {}) {
       type: finalType,
       lastUpdated: now,
       ttl: 24 * 60 * 60 * 1000,
+      logCacheGen: SENSOR_LOG_CACHE_GEN,
     });
 
     await new Promise((resolve) => {

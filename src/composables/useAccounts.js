@@ -23,6 +23,7 @@ import {
 } from "../utils/idb";
 import { idbschemas, settings } from "@config";
 import { fetchJson } from "@/utils/utils";
+import { canonicalSensorId } from "@/utils/sensorId";
 import { Keyring } from "@polkadot/keyring";
 import {
   cryptoWaitReady,
@@ -72,13 +73,19 @@ function ensureAccountsStoreMigrated() {
 const USER_SENSORS_TTL_MS = 15 * 60 * 1000; // 15 minutes
 const userSensorsCache = new Map(); // owner -> { ts, data } | { promise }
 
+function uniqueCanonicalSensorIds(ids) {
+  return [
+    ...new Set((Array.isArray(ids) ? ids : []).map((id) => canonicalSensorId(id)).filter(Boolean)),
+  ];
+}
+
 /** Sync read of a fresh in-memory getUserSensors result (null if missing or stale). */
 export function peekUserSensorsCache(owner) {
   const key = String(owner || "").trim();
   if (!key) return null;
   const cached = userSensorsCache.get(key);
   if (cached?.data && Date.now() - cached.ts < USER_SENSORS_TTL_MS) {
-    return cached.data;
+    return uniqueCanonicalSensorIds(cached.data);
   }
   return null;
 }
@@ -90,13 +97,12 @@ async function fetchOwnerSensorsNetwork(owner) {
   const base = String(settings.REMOTE_PROVIDER || "").replace(/\/$/, "");
 
   const parseSensorIds = (payload) => {
-    if (Array.isArray(payload?.result)) {
-      return payload.result.map((id) => String(id)).filter(Boolean);
-    }
-    if (Array.isArray(payload?.sensors)) {
-      return payload.sensors.map((id) => String(id)).filter(Boolean);
-    }
-    return [];
+    const raw = Array.isArray(payload?.result)
+      ? payload.result
+      : Array.isArray(payload?.sensors)
+        ? payload.sensors
+        : [];
+    return uniqueCanonicalSensorIds(raw);
   };
 
   const remember = (data) => {
@@ -372,7 +378,7 @@ async function normalizeAccountsFromStorage(list) {
 function withDefaultDevices(acc) {
   if (!acc || typeof acc !== "object") return acc;
   const devices = Array.isArray(acc.devices)
-    ? acc.devices.map((id) => String(id)).filter(Boolean)
+    ? [...new Set(acc.devices.map((id) => canonicalSensorId(id)).filter(Boolean))]
     : [];
   if (devices.length > 0) return { ...acc, devices };
   const sid = String(acc.address || "").trim();
@@ -530,8 +536,8 @@ export function useAccounts() {
     const local = Array.isArray(acc?.devices)
       ? acc.devices.map((id) => String(id)).filter(Boolean)
       : [];
-    if (!fromApi.length) return local;
-    return [...new Set([...fromApi, ...local])];
+    if (!fromApi.length) return uniqueCanonicalSensorIds(local);
+    return uniqueCanonicalSensorIds([...fromApi, ...local]);
   };
 
   return {

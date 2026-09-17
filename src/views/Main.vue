@@ -35,7 +35,13 @@ import { useRouter, useRoute } from "vue-router";
 import { useI18n } from "vue-i18n";
 
 import { useMap } from "@/composables/useMap";
-import { measurementBagHasEncryptedValues } from "@/utils/sensorValueCrypto";
+import {
+  measurementBagHasEncryptedValues,
+  mergeMeasurementBags,
+  measurementBagsEqual,
+  hasPendingProtoPrivate,
+} from "@/utils/sensorValueCrypto";
+import { decryptProtoPrivate } from "@/utils/proto/decodeEnvelope";
 import { useAccounts } from "@/composables/useAccounts";
 
 import Header from "../components/header/Header.vue";
@@ -124,15 +130,20 @@ provide(SENSOR_PAGE_META_KEY, { pageTitle, pageDescription });
 const sensorsList = () => (Array.isArray(sensors.value) ? sensors.value : []);
 
 /** Deep-link popup shell — geo/address come from readings API, not URL or stale map rows. */
-const pointFromSensorQuery = (sensorId, fullSensorData, query) =>
-  formatPointForSensor({
+const pointFromSensorQuery = (sensorId, fullSensorData, query) => {
+  const prev = sensorPoint.value;
+  const sameSensor = prev && String(prev.sensor_id) === String(sensorId);
+  return formatPointForSensor({
     sensor_id: sensorId,
     owner: fullSensorData?.owner ?? (query.owner ? String(query.owner) : null),
-    device_model: fullSensorData?.device_model ?? null,
-    model: fullSensorData?.model,
+    device_model: fullSensorData?.device_model ?? (sameSensor ? prev.device_model : null) ?? null,
+    model: fullSensorData?.model ?? (sameSensor ? prev.model : null),
     maxdata: fullSensorData?.maxdata,
     data: fullSensorData?.data,
+    proto: fullSensorData?.proto === true || (sameSensor && prev?.proto === true),
+    idbSensorType: sameSensor ? prev.idbSensorType : null,
   });
+};
 
 /** Shell device for `?owner=` without `sensor=` — does not affect picker bundle (full list). */
 const pickOwnerShellSensorId = async (owner, lat, lng) => {
@@ -260,6 +271,7 @@ function startLiveFeed() {
 
 // Callback для обработки realtime данных
 const onRealtimePoint = async (point) => {
+  let livePoint = point;
   let streamData = point.data;
   const streamOwner = normalizeOwnerKey(point);
   const sensorId = String(point?.sensor_id || "");
@@ -268,24 +280,41 @@ const onRealtimePoint = async (point) => {
     streamOwner,
     sensorId
   );
+  if (ownerAccount && hasPendingProtoPrivate(livePoint)) {
+    livePoint = await decryptProtoPrivate(livePoint, ownerAccount);
+    streamData = livePoint.data;
+  }
   if (ownerAccount && measurementBagHasEncryptedValues(streamData)) {
     streamData = await redecryptDataBag(sensorId, streamData, ownerAccount);
   }
 
   if (mapState.currentProvider.value === "realtime") {
+    const prevPopup = isSensorOpen(point.sensor_id) ? sensorPoint.value : null;
+    const listOwner = sensorsList().find(
+      (s) => String(s?.sensor_id || "") === String(point.sensor_id)
+    );
+    streamData = mergeMeasurementBags(
+      prevPopup?.data || listOwner?.data,
+      streamData
+    );
+    const nextOwner =
+      normalizeOwnerKey(livePoint) ||
+      normalizeOwnerKey(listOwner) ||
+      normalizeOwnerKey(prevPopup);
     setSensorData(point.sensor_id, {
-      geo: point.geo,
-      model: point.model,
+      geo: livePoint.geo,
+      model: livePoint.model,
       data: streamData,
-      owner: normalizeOwnerKey(point) || null,
-      device_model: point.device_model || null,
-      timestamp: point.timestamp,
+      ...(nextOwner ? { owner: nextOwner } : {}),
+      device_model: livePoint.device_model || null,
+      timestamp: livePoint.timestamp,
+      proto: livePoint.proto === true,
+      protoPrivate: livePoint.protoPrivate ?? null,
     });
-    updateSensorMarker(point);
+    updateSensorMarker(livePoint);
 
     if (!isSensorOpen(point.sensor_id)) return;
 
-    const prevPopup = sensorPoint.value;
     const prevLogs = (Array.isArray(prevPopup?.logs) ? prevPopup.logs : [])
       .map((item) => {
         const ts = Number(item?.timestamp);
@@ -295,42 +324,69 @@ const onRealtimePoint = async (point) => {
         return entry;
       })
       .filter(Boolean);
-    const ts = Number(point?.timestamp);
+    const ts = Number(livePoint?.timestamp);
     const entry =
       Number.isFinite(ts) && streamData
         ? {
             timestamp: ts,
             data: streamData,
-            ...(hasValidCoordinates(point?.geo) ? { geo: point.geo } : null),
+            ...(hasValidCoordinates(livePoint?.geo) ? { geo: livePoint.geo } : null),
           }
         : null;
-    const nextLogs =
-      entry && !prevLogs.some((item) => item.timestamp === entry.timestamp)
-        ? [...prevLogs, entry]
-        : prevLogs;
+    let nextLogs = prevLogs;
+    if (entry) {
+      const idx = prevLogs.findIndex((item) => item.timestamp === entry.timestamp);
+      if (idx >= 0) {
+        const mergedData = mergeMeasurementBags(prevLogs[idx].data, entry.data);
+        if (measurementBagsEqual(prevLogs[idx].data, mergedData)) {
+          nextLogs = prevLogs;
+        } else {
+          nextLogs = prevLogs.map((item, i) =>
+            i === idx ? { ...item, ...entry, data: mergedData } : item
+          );
+        }
+      } else {
+        nextLogs = [...prevLogs, entry];
+      }
+    }
 
-    const listOwner = sensorsList().find(
-      (s) => String(s?.sensor_id || "") === String(point.sensor_id)
-    );
     const nextPopupOwner =
-      normalizeOwnerKey(point) || normalizeOwnerKey(listOwner) || normalizeOwnerKey(prevPopup) || null;
+      normalizeOwnerKey(livePoint) ||
+      normalizeOwnerKey(listOwner) ||
+      normalizeOwnerKey(prevPopup) ||
+      null;
     const bundlePoint = {
       ...prevPopup,
       owner: nextPopupOwner,
-      geo: point.geo || prevPopup?.geo,
-      sensor_id: point.sensor_id,
-      device_model: point.device_model || prevPopup?.device_model || null,
+      geo: livePoint.geo || prevPopup?.geo,
+      sensor_id: livePoint.sensor_id,
+      device_model: livePoint.device_model || prevPopup?.device_model || null,
     };
     const ownerSensorsWithData = buildOwnerSensorsWithData(bundlePoint, sensorsList());
 
+    const logsRefUnchanged = nextLogs === prevLogs;
+    const dataUnchanged = measurementBagsEqual(prevPopup?.data, streamData);
+    if (logsRefUnchanged && dataUnchanged) {
+      const protoOn = livePoint.proto === true || prevPopup?.proto === true;
+      if (protoOn && prevPopup?.proto !== true) {
+        sensorPoint.value = { ...prevPopup, proto: true };
+      }
+      return;
+    }
+
     sensorPoint.value = {
       ...prevPopup,
-      geo: point.geo || prevPopup?.geo,
-      model: point.model || prevPopup?.model,
+      geo: livePoint.geo || prevPopup?.geo,
+      model: livePoint.model || prevPopup?.model,
       owner: nextPopupOwner,
-      device_model: point.device_model || prevPopup?.device_model || null,
+      device_model: livePoint.device_model || prevPopup?.device_model || null,
+      proto: livePoint.proto === true || prevPopup?.proto === true,
+      protoPrivate:
+        livePoint.protoPrivate === null
+          ? null
+          : livePoint.protoPrivate || prevPopup?.protoPrivate || null,
       data: streamData,
-      logs: nextLogs,
+      logs: logsRefUnchanged ? prevPopup.logs : nextLogs,
       ...(ownerSensorsWithData?.length ? { ownerSensorsWithData } : null),
     };
     return;

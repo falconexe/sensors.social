@@ -19,6 +19,7 @@ import {
   listBundleSensorEntries,
   parseBundleSensorEntry,
   preloadSensorMeta,
+  canonicalSensorId,
   normalizeOwnerKey,
   hasSensorOwner,
   haversineKm,
@@ -31,6 +32,10 @@ import {
 const OWNER_PICKER_TYPES = ["urban", "insight"];
 const DIY_PICKER_TYPES = ["diy", "urban", "insight"];
 const PM_LOG_KEYS = ["pm25", "pm10"];
+
+function idsEq(a, b) {
+  return String(a || "") === String(b || "");
+}
 
 /** Markers-API `sensors[]` siblings for an owner map row. */
 export function markerSensorsEntries(point, sensorsList = null) {
@@ -49,8 +54,8 @@ export function resolveBundleAnchorGeo(point, sensorsList) {
   if (hasValidCoordinates(point?.geo)) return point.geo;
   const sid = point?.sensor_id ? String(point.sensor_id) : "";
   if (!sid) return null;
-  const fromList = (Array.isArray(sensorsList) ? sensorsList : []).find(
-    (s) => String(s?.sensor_id || "") === sid
+  const fromList = (Array.isArray(sensorsList) ? sensorsList : []).find((s) =>
+    idsEq(s?.sensor_id, sid)
   );
   if (hasValidCoordinates(fromList?.geo)) return fromList.geo;
   return null;
@@ -60,11 +65,11 @@ export function resolveBundleAnchorGeo(point, sensorsList) {
 export function resolveMarkerSiblingGeo(sensorId, point, sensorsList = null) {
   const id = String(sensorId || "");
   if (!id) return null;
-  if (String(point?.sensor_id || "") === id && hasValidCoordinates(point?.geo)) {
+  if (idsEq(point?.sensor_id, id) && hasValidCoordinates(point?.geo)) {
     return point.geo;
   }
-  const fromList = (Array.isArray(sensorsList) ? sensorsList : []).find(
-    (s) => String(s?.sensor_id || "") === id
+  const fromList = (Array.isArray(sensorsList) ? sensorsList : []).find((s) =>
+    idsEq(s?.sensor_id, id)
   );
   if (fromList?.geo && hasValidCoordinates(fromList.geo)) return fromList.geo;
   for (const unit of ["pm10", "pm25", "co2", "temperature", "noisemax", "humidity"]) {
@@ -81,13 +86,27 @@ export function resolveMarkerSiblingGeo(sensorId, point, sensorsList = null) {
   return null;
 }
 
+/** True when RoSeMAN/v2 lists this id as a co-located bundle sibling of `point`. */
+function isDeclaredBundleSibling(sensorId, point, sensorsList = null) {
+  const sid = String(sensorId || "").trim();
+  if (!sid) return false;
+  if (idsEq(point?.sensor_id, sid)) return true;
+  for (const entry of markerSensorsEntries(point, sensorsList)) {
+    const parsed = parseBundleSensorEntry(entry);
+    if (parsed && idsEq(parsed.sensor_id, sid)) return true;
+  }
+  const meta = getCachedSensorMeta(point?.sensor_id);
+  if (!meta) return false;
+  return listBundleSensorEntries(meta).some((e) => idsEq(e.sensor_id, sid));
+}
+
 /** True when sibling is within OWNER_GEO_CLUSTER_KM of the bundle anchor (or geo unknown). */
 export function isMarkerSiblingNearAnchor(sensorId, point, sensorsList = null) {
   const anchorGeo = resolveBundleAnchorGeo(point, sensorsList);
   if (!hasValidCoordinates(anchorGeo)) return true;
   const geo = resolveMarkerSiblingGeo(sensorId, point, sensorsList);
-  if (!geo) return false;
-  return haversineKm(anchorGeo, geo) <= OWNER_GEO_CLUSTER_KM;
+  if (geo) return haversineKm(anchorGeo, geo) <= OWNER_GEO_CLUSTER_KM;
+  return isDeclaredBundleSibling(sensorId, point, sensorsList);
 }
 
 /** Resolve urban/insight/diy per id from map row, markers siblings, v2 meta, or active point. */
@@ -95,28 +114,48 @@ export function inferTypesForOwnerIds(ids, sensorsList, activePoint) {
   const currentId = String(activePoint?.sensor_id || "");
   return ids.map((id) => {
     const sid = String(id);
-    const fromMap = (Array.isArray(sensorsList) ? sensorsList : []).find(
-      (s) => String(s?.sensor_id || "") === sid
+    const fromMap = (Array.isArray(sensorsList) ? sensorsList : []).find((s) =>
+      idsEq(s?.sensor_id, sid)
     );
     const metaEntry = (() => {
       const meta = getCachedSensorMeta(activePoint?.sensor_id);
       if (!meta) return null;
-      return listBundleSensorEntries(meta).find((e) => String(e.sensor_id) === sid) || null;
+      return listBundleSensorEntries(meta).find((e) => idsEq(e.sensor_id, sid)) || null;
     })();
     const markerSibling = (() => {
       const raw = Array.isArray(activePoint?.sensors) ? activePoint.sensors : [];
-      return raw.map(parseBundleSensorEntry).find((e) => e && String(e.sensor_id) === sid) || null;
+      return raw.map(parseBundleSensorEntry).find((e) => e && idsEq(e.sensor_id, sid)) || null;
     })();
+    const siblingMeta = getCachedSensorMeta(sid);
+    const siblingLogs = Array.isArray(siblingMeta?.data?.[sid])
+      ? siblingMeta.data[sid]
+      : Array.isArray(siblingMeta?.data)
+        ? siblingMeta.data
+        : null;
+    const siblingLogType = inferDeviceTypeFromLog(siblingLogs);
+    const fromPrev = Array.isArray(activePoint?.ownerSensorsWithData)
+      ? activePoint.ownerSensorsWithData.find((o) => idsEq(o?.id, sid))
+      : null;
+    const fromPrevType =
+      sensorTypeFromDeviceModel(fromPrev?.device_model) ||
+      (fromPrev?.type === "insight" || fromPrev?.type === "urban" || fromPrev?.type === "diy"
+        ? fromPrev.type
+        : null);
     const type =
       sensorTypeFromDeviceModel(fromMap?.device_model) ||
       sensorTypeFromDeviceModel(markerSibling?.device_model) ||
       sensorTypeFromDeviceModel(metaEntry?.device_model) ||
-      (sid === currentId
+      sensorTypeFromDeviceModel(siblingMeta?.device_model) ||
+      fromPrevType ||
+      (idsEq(sid, currentId)
         ? sensorTypeFromDeviceModel(activePoint?.device_model) ||
-          (activePoint?.idbSensorType && activePoint.idbSensorType !== "diy"
+          (activePoint?.idbSensorType &&
+          activePoint.idbSensorType !== "diy" &&
+          activePoint.idbSensorType !== "altruist"
             ? activePoint.idbSensorType
             : null)
-        : null);
+        : null) ||
+      siblingLogType;
     return { id: sid, type };
   });
 }
@@ -146,26 +185,36 @@ export function buildOwnerBundleFromIds(
   typedEntries = null
 ) {
   if (!Array.isArray(ids) || ids.length === 0) return null;
+  ids = [...new Set(ids.map((id) => String(id || "")).filter(Boolean))];
 
   const typed = typedEntries || inferTypesForOwnerIds(ids, sensorsList, activePoint);
 
   return typed.map(({ id: sid, type }) => {
-    const fromMap = (Array.isArray(sensorsList) ? sensorsList : []).find(
-      (s) => String(s?.sensor_id || "") === sid
+    const fromMap = (Array.isArray(sensorsList) ? sensorsList : []).find((s) =>
+      idsEq(s?.sensor_id, sid)
     );
+    const fromPrev = Array.isArray(activePoint?.ownerSensorsWithData)
+      ? activePoint.ownerSensorsWithData.find((o) => idsEq(o?.id, sid))
+      : null;
     const geo =
       (fromMap?.geo && hasValidCoordinates(fromMap.geo) ? fromMap.geo : null) ||
-      (sid === String(activeSensorId || "") && hasValidCoordinates(activePoint?.geo)
+      (fromPrev?.geo && hasValidCoordinates(fromPrev.geo) ? fromPrev.geo : null) ||
+      (idsEq(sid, activeSensorId) && hasValidCoordinates(activePoint?.geo)
         ? activePoint.geo
         : null);
     const hasGeo = hasValidCoordinates(geo);
+    const rowType = type || fromPrev?.type || null;
 
     return {
       id: sid,
-      hasData: hasGeo,
-      type,
+      hasData: hasGeo || fromPrev?.hasData === true,
+      type: rowType,
       geo: hasGeo ? geo : null,
-      device_model: fromMap?.device_model || null,
+      device_model:
+        fromPrev?.device_model ||
+        fromMap?.device_model ||
+        (rowType === "insight" || rowType === "urban" ? rowType : null),
+      proto: fromMap?.proto === true || fromPrev?.proto === true,
     };
   });
 }
@@ -187,26 +236,118 @@ export function finalizeOwnerBundleNearAnchor(rows, anchorGeo, activeSensorId, c
 
   const sid = String(activeSensorId || "");
   if (!hasValidCoordinates(anchorGeo)) {
-    const self = sid
-      ? list.find((o) => String(o.id) === sid && o.geo && hasValidCoordinates(o.geo))
-      : null;
-    return self ? [self] : null;
+    const self = sid ? list.find((o) => idsEq(o.id, sid)) : null;
+    if (self) return [self];
+    const withGeo = list.filter((o) => o?.geo && hasValidCoordinates(o.geo));
+    return withGeo.length > 0 ? withGeo : null;
   }
 
-  return filterOwnerBundleNearAnchor(list, anchorGeo, activeSensorId);
+  const nearby = filterOwnerBundleNearAnchor(list, anchorGeo, activeSensorId);
+  if (sid && nearby && !nearby.some((o) => idsEq(o.id, sid))) {
+    const self = list.find((o) => idsEq(o.id, sid));
+    if (self) return [self, ...nearby];
+  }
+  return nearby;
 }
 
 /** Urban picker slot also matches legacy `altruist` type id. */
-function pickerSlotType(entry, slotType) {
-  const t = entry?.type || null;
-  if (t === slotType) return true;
-  if (slotType === "urban" && t === "altruist") return true;
-  return false;
+function pickerTypeOf(entry, point = null, logSamples = null) {
+  if (point && idsEq(entry?.id, point?.sensor_id)) {
+    const fromPoint = knownPickerType(
+      sensorTypeFromDeviceModel(point.device_model) ||
+        (point.idbSensorType && point.idbSensorType !== "altruist" ? point.idbSensorType : null)
+    );
+    if (fromPoint) return fromPoint;
+  }
+  const raw = knownPickerType(entry?.type || sensorTypeFromDeviceModel(entry?.device_model));
+  if (raw) return raw;
+  if (point && idsEq(entry?.id, point?.sensor_id)) {
+    return knownPickerType(resolveSensorType(point, logSamples));
+  }
+  return raw;
 }
 
-function findBundleEntryForSlot(bundle, slotType) {
-  const list = Array.isArray(bundle) ? bundle : [];
-  return list.find((o) => pickerSlotType(o, slotType) && o?.id) || null;
+function pickerSlotType(entry, slotType, point = null, logSamples = null) {
+  return pickerTypeOf(entry, point, logSamples) === slotType;
+}
+
+function knownPickerType(value) {
+  if (value === "insight" || value === "diy") return value;
+  if (value === "urban" || value === "altruist") return "urban";
+  return null;
+}
+
+/** True when the picker already has both Urban and Insight ids. */
+export function ownerBundleHasPair(rows) {
+  const types = new Set();
+  for (const o of Array.isArray(rows) ? rows : []) {
+    const t = knownPickerType(o?.type || o?.device_model);
+    if (t === "urban" || t === "insight") types.add(t);
+  }
+  return types.has("urban") && types.has("insight");
+}
+
+function bundleEntryFromPoint(point, sensorsList = null) {
+  const sid = canonicalSensorId(point?.sensor_id);
+  if (!sid) return null;
+  const fromMap = (Array.isArray(sensorsList) ? sensorsList : []).find((s) =>
+    idsEq(s?.sensor_id, sid)
+  );
+  const geo =
+    (hasValidCoordinates(point?.geo) ? point.geo : null) ||
+    (fromMap?.geo && hasValidCoordinates(fromMap.geo) ? fromMap.geo : null);
+  const type = knownPickerType(
+    sensorTypeFromDeviceModel(point?.device_model) ||
+      sensorTypeFromDeviceModel(fromMap?.device_model) ||
+      (point?.idbSensorType && point.idbSensorType !== "diy" && point.idbSensorType !== "altruist"
+        ? point.idbSensorType
+        : null)
+  );
+  return {
+    id: sid,
+    hasData: hasValidCoordinates(geo),
+    type,
+    geo: hasValidCoordinates(geo) ? geo : null,
+    device_model: point?.device_model || fromMap?.device_model || null,
+    proto: point?.proto === true || fromMap?.proto === true,
+  };
+}
+
+function withCurrentBundleEntry(rows, point, sensorsList = null) {
+  const current = bundleEntryFromPoint(point, sensorsList);
+  if (!current) return Array.isArray(rows) ? rows : null;
+  const list = Array.isArray(rows) ? [...rows] : [];
+  const idx = list.findIndex((o) => idsEq(o?.id, current.id));
+  if (idx < 0) {
+    list.unshift(current);
+    return list;
+  }
+  const existing = list[idx];
+  const device_model = current.device_model || existing.device_model;
+  list[idx] = {
+    ...existing,
+    ...current,
+    id: existing.id || current.id,
+    geo: current.geo || existing.geo,
+    device_model,
+    type: knownPickerType(device_model) || current.type || existing.type,
+    hasData: existing.hasData === true || current.hasData === true,
+    proto: existing.proto === true || current.proto === true,
+  };
+  return list;
+}
+
+function findBundleEntryForSlot(bundle, slotType, preferId = null, point = null, logSamples = null) {
+  const matches = (Array.isArray(bundle) ? bundle : []).filter(
+    (o) => pickerSlotType(o, slotType, point, logSamples) && o?.id
+  );
+  if (matches.length === 0) return null;
+  const prefer = String(preferId || "");
+  if (prefer) {
+    const current = matches.find((o) => idsEq(o.id, prefer));
+    if (current) return current;
+  }
+  return matches.find((o) => o.proto === true) || matches[0];
 }
 
 /**
@@ -220,11 +361,22 @@ export function buildSensorPickerRows(point, logSamples = null) {
   const types = hasOwner ? OWNER_PICKER_TYPES : DIY_PICKER_TYPES;
   const bundle = hasOwner ? point?.ownerSensorsWithData : null;
 
-  const bundleWithGeo = hasOwner
-    ? (Array.isArray(bundle) ? bundle : []).filter((e) => e?.geo && hasValidCoordinates(e.geo))
-    : null;
+  const bundleRows = hasOwner
+    ? withCurrentBundleEntry(Array.isArray(bundle) ? bundle : [], point, null)
+    : [];
 
-  if (hasOwner && (!bundleWithGeo || bundleWithGeo.length === 0)) {
+  const bundleForPicker = hasOwner
+    ? bundleRows.filter(
+        (e) =>
+          idsEq(e?.id, currentId) ||
+          (e?.geo && hasValidCoordinates(e.geo)) ||
+          e?.type === "insight" ||
+          e?.type === "urban" ||
+          e?.type === "altruist"
+      )
+    : [];
+
+  if (hasOwner && bundleForPicker.length === 0) {
     return OWNER_PICKER_TYPES.map((type) => ({ type, sensorId: null, state: "missing" }));
   }
 
@@ -236,21 +388,32 @@ export function buildSensorPickerRows(point, logSamples = null) {
       return { type, sensorId: null, state: "missing" };
     }
 
-    const entry = findBundleEntryForSlot(bundleWithGeo, type);
+    const entry = findBundleEntryForSlot(bundleForPicker, type, currentId, point, logSamples);
     if (!entry) return { type, sensorId: null, state: "missing" };
 
     const id = String(entry.id);
-    if (id === currentId) return { type, sensorId: id, state: "active" };
-    return { type, sensorId: id, state: "available" };
+    if (idsEq(id, currentId)) {
+      return { type, sensorId: id, state: "active", proto: entry.proto === true };
+    }
+    return { type, sensorId: id, state: "available", proto: entry.proto === true };
   });
 
   if (hasOwner && currentId && !rows.some((r) => r.state === "active")) {
-    const currentType = resolveSensorType(point, logSamples);
-    const slotType =
-      currentType === "insight" ? "insight" : currentType === "diy" ? "diy" : "urban";
+    const currentType = pickerTypeOf(
+      bundleForPicker.find((e) => idsEq(e?.id, currentId)) || { id: currentId },
+      point,
+      logSamples
+    );
+    const slotType = knownPickerType(currentType);
     const idx = rows.findIndex((r) => r.type === slotType);
     if (idx >= 0) {
-      rows[idx] = { type: slotType, sensorId: currentId, state: "active" };
+      const currentEntry = bundleForPicker.find((e) => idsEq(e?.id, currentId));
+      rows[idx] = {
+        type: slotType,
+        sensorId: currentId,
+        state: "active",
+        proto: currentEntry?.proto === true || point?.proto === true,
+      };
     }
   }
 
@@ -324,20 +487,28 @@ export function mergeOwnerBundleLists(pubsub, meta) {
   if (m.length === 0) return p.length > 0 ? p : null;
   if (p.length === 0) return m;
 
-  const byId = new Map(m.map((o) => [String(o.id), { ...o }]));
+  const byId = new Map();
+  for (const o of m) {
+    const id = String(o?.id || "");
+    if (id) byId.set(id, { ...o });
+  }
   for (const o of p) {
-    const id = String(o.id);
+    const id = String(o?.id || "");
+    if (!id) continue;
     const existing = byId.get(id);
     if (existing) {
       byId.set(id, {
         ...existing,
         ...o,
+        id,
         geo: o.geo || existing.geo,
         type: existing.type || o.type,
+        device_model: existing.device_model || o.device_model,
         hasData: existing.hasData === true || o.hasData === true,
+        proto: existing.proto === true || o.proto === true,
       });
     } else {
-      byId.set(id, o);
+      byId.set(id, { ...o });
     }
   }
   return Array.from(byId.values());
@@ -370,7 +541,7 @@ function buildPubsubOwnerList(point, sensorsList, anchorGeo, clusterBundle = tru
   if (nearby.length === 0) return null;
 
   const ids = nearby.map((s) => String(s.sensor_id));
-  if (sid && !ids.includes(sid)) {
+  if (sid && !ids.some((id) => idsEq(id, sid))) {
     const self = ownerSensors.find((s) => String(s?.sensor_id || "") === sid);
     if (self && hasValidCoordinates(self?.geo)) {
       ids.unshift(sid);
@@ -388,10 +559,14 @@ function ownerIdsFromV2Meta(sensorId) {
 }
 
 export function resolveOwnerSensorIds(point, ownerKey, ownerSensorIds = null) {
-  const explicit = ownerSensorIds ?? point?.ownerSensorIds ?? peekUserSensorsCache(ownerKey);
-  if (Array.isArray(explicit) && explicit.length > 0) return explicit;
-
   const sid = point?.sensor_id ? String(point.sensor_id) : "";
+  const explicit = ownerSensorIds ?? point?.ownerSensorIds ?? peekUserSensorsCache(ownerKey);
+  if (Array.isArray(explicit) && explicit.length > 0) {
+    const ids = explicit.map((id) => String(id)).filter(Boolean);
+    if (sid && !ids.some((id) => id === sid)) ids.unshift(sid);
+    return ids;
+  }
+
   return sid ? ownerIdsFromV2Meta(sid) : null;
 }
 
@@ -449,16 +624,29 @@ export function buildOwnerSensorsWithData(
   if (!ownerKey && !point?.sensor_id) return null;
 
   const sid = point?.sensor_id;
-  const ids = resolveOwnerSensorIds(point, ownerKey, ownerSensorIds);
+  const cachedIds = resolveOwnerSensorIds(point, ownerKey, ownerSensorIds);
+  const ids = [
+    ...new Set(
+      [
+        sid ? String(sid) : "",
+        ...(Array.isArray(cachedIds) ? cachedIds : []),
+        ...collectOwnerDeviceIds(ownerKey, sensorsList),
+      ].filter(Boolean)
+    ),
+  ];
   const anchorGeo = resolveBundleAnchorGeo(point, sensorsList);
 
   let fromOwnerApi = null;
-  if (ids) {
+  if (ids.length) {
     const typed = inferTypesForOwnerIds(ids, sensorsList, point);
     fromOwnerApi = buildOwnerBundleFromIds(ids, sensorsList, sid, point, typed);
   }
 
-  return mergeOwnerBundleSources(point, sensorsList, anchorGeo, fromOwnerApi, clusterBundle);
+  return withCurrentBundleEntry(
+    mergeOwnerBundleSources(point, sensorsList, anchorGeo, fromOwnerApi, clusterBundle),
+    point,
+    sensorsList
+  );
 }
 
 /** Async bundle build: may preload v2 meta and merge map markers. */
@@ -472,17 +660,30 @@ export async function buildOwnerSensorsWithDataAsync(
   if (!ownerKey && !point?.sensor_id) return null;
 
   const sid = point?.sensor_id;
-  const ids = await ensureOwnerSensorIds(point, ownerKey, ownerSensorIds, sensorsList);
+  const cachedIds = await ensureOwnerSensorIds(point, ownerKey, ownerSensorIds, sensorsList);
+  const ids = [
+    ...new Set(
+      [
+        sid ? String(sid) : "",
+        ...(Array.isArray(cachedIds) ? cachedIds : []),
+        ...collectOwnerDeviceIds(ownerKey, sensorsList),
+      ].filter(Boolean)
+    ),
+  ];
   const anchorGeo = resolveBundleAnchorGeo(point, sensorsList);
 
   let fromOwnerApi = null;
-  if (ids?.length) {
+  if (ids.length) {
     let typed = inferTypesForOwnerIds(ids, sensorsList, point);
     typed = await enrichOwnerIdsWithIdbTypes(typed);
     fromOwnerApi = buildOwnerBundleFromIds(ids, sensorsList, sid, point, typed);
   }
 
-  return mergeOwnerBundleSources(point, sensorsList, anchorGeo, fromOwnerApi, clusterBundle);
+  return withCurrentBundleEntry(
+    mergeOwnerBundleSources(point, sensorsList, anchorGeo, fromOwnerApi, clusterBundle),
+    point,
+    sensorsList
+  );
 }
 
 export function mergeOwnerBundleOptions(fresh, prevOptions) {
@@ -495,11 +696,10 @@ export function applyFilteredOwnerBundleOptions(point, prevOptions, sensorsList,
   if (!point) return null;
   const anchorGeo = resolveBundleAnchorGeo(point, sensorsList);
   const fresh = buildOwnerSensorsWithData(point, sensorsList, null, clusterBundle);
-  const source = fresh?.length
-    ? fresh
-    : Array.isArray(prevOptions)
-      ? prevOptions.filter(Boolean)
-      : null;
+  const source =
+    mergeOwnerBundleOptions(fresh, prevOptions) ||
+    (Array.isArray(fresh) && fresh.length ? fresh : null) ||
+    (Array.isArray(prevOptions) ? prevOptions.filter(Boolean) : null);
   if (!source?.length) return null;
   return finalizeOwnerBundleNearAnchor(source, anchorGeo, point.sensor_id, clusterBundle);
 }
