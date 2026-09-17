@@ -261,7 +261,13 @@ const isLocalStorageAvailable = () => {
 };
 
 const availableOptions = computed(() => {
-  let opts = availableUnits.value
+  const keys = new Set(availableUnits.value.map((u) => String(u).toLowerCase()));
+  const current = String(type.value || "").toLowerCase();
+  if (current && measurements[current] && current !== "noise" && current !== "aqi") {
+    keys.add(current);
+  }
+
+  let opts = [...keys]
     .map((key) => {
       const info = measurements[key];
       if (!info) {
@@ -269,10 +275,10 @@ const availableOptions = computed(() => {
       }
       return {
         value: key,
-        name: info.nameshort?.[locale.value] || info.label,
+        name: info.nameshort?.[locale.value] || info.label || key.toUpperCase(),
       };
     })
-    .filter((item) => Boolean(item));
+    .filter((item) => Boolean(item?.name));
 
   // Remove legacy / map-unavailable options
   opts = opts.filter((opt) => opt.value !== "noise" && opt.value !== "aqi");
@@ -301,7 +307,9 @@ const loadAvailableUnits = async () => {
       units = collectUnitsFromMapSensors(sensorsUI.sensors);
     } else {
       const { end } = sensorFetchBoundsForDate(start.value);
-      units = await listMeasurementsOnMap(start.value, end);
+      const fromApi = await listMeasurementsOnMap(start.value, end);
+      const fromSensors = collectUnitsFromMapSensors(sensorsUI.sensors);
+      units = sortMapLayerUnits([...new Set([...fromApi, ...fromSensors])]);
     }
     availableUnits.value = sortMapLayerUnits(units.length > 0 ? units : ["pm10"]);
     ensureValidUnitSelection(availableUnits.value);
@@ -407,7 +415,7 @@ watch(
 watch(
   () => sensorsUI.sensors,
   () => {
-    if (realtime.value) void loadAvailableUnits();
+    void loadAvailableUnits();
   },
   { deep: true }
 );

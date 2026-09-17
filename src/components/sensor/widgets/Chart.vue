@@ -112,12 +112,31 @@ const clearLegendCache = () => {
 
 const UNITS_FOUND = ref(new Set());
 
+function isPlainMeasurement(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function logHasPlainUnit(log, unitId) {
+  const id = String(unitId || "").toLowerCase();
+  if (!id || !Array.isArray(log)) return false;
+  return log.some((item) => isPlainMeasurement(item?.data?.[id]));
+}
+
 function isMapUnitAvailableInData(unit, ids) {
   const cur = String(unit || "").toLowerCase();
   if (!cur || !ids?.size) return false;
   if (ids.has(cur)) return true;
   const groupKey = GROUPS_LOOKUP[cur];
   if (groupKey) return GROUPS[groupKey].members.some((m) => ids.has(m));
+  return false;
+}
+
+function currentUnitHasPlainData(unit, log) {
+  const cur = String(unit || "").toLowerCase();
+  if (!cur) return false;
+  if (logHasPlainUnit(log, cur)) return true;
+  const groupKey = GROUPS_LOOKUP[cur];
+  if (groupKey) return GROUPS[groupKey].members.some((m) => logHasPlainUnit(log, m));
   return false;
 }
 
@@ -1280,22 +1299,22 @@ watch(
     }
 
     // Check if current unit is available
-    const curAvailable = isMapUnitAvailableInData(cur, ids);
+    const curAvailable =
+      isMapUnitAvailableInData(cur, ids) && currentUnitHasPlainData(cur, safeLog.value);
     if (curAvailable) return;
 
-    // Find first available parameter by checking groups in order
+    // Prefer a real numeric series so the map/footer are not stuck on e.proto keys.
     let next = null;
     for (const [groupKey, groupInfo] of Object.entries(GROUPS)) {
-      const firstAvailable = groupInfo.members.find((member) => ids.has(member));
+      const firstAvailable = groupInfo.members.find((member) => logHasPlainUnit(safeLog.value, member));
       if (firstAvailable) {
         next = firstAvailable;
         break;
       }
     }
 
-    // If no group member found, use the first available parameter
     if (!next) {
-      next = idsArr[0];
+      next = idsArr.find((id) => logHasPlainUnit(safeLog.value, id)) || null;
     }
 
     if (next) {

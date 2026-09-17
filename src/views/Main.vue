@@ -130,16 +130,20 @@ provide(SENSOR_PAGE_META_KEY, { pageTitle, pageDescription });
 const sensorsList = () => (Array.isArray(sensors.value) ? sensors.value : []);
 
 /** Deep-link popup shell — geo/address come from readings API, not URL or stale map rows. */
-const pointFromSensorQuery = (sensorId, fullSensorData, query) =>
-  formatPointForSensor({
+const pointFromSensorQuery = (sensorId, fullSensorData, query) => {
+  const prev = sensorPoint.value;
+  const sameSensor = prev && String(prev.sensor_id) === String(sensorId);
+  return formatPointForSensor({
     sensor_id: sensorId,
     owner: fullSensorData?.owner ?? (query.owner ? String(query.owner) : null),
-    device_model: fullSensorData?.device_model ?? null,
-    model: fullSensorData?.model,
+    device_model: fullSensorData?.device_model ?? (sameSensor ? prev.device_model : null) ?? null,
+    model: fullSensorData?.model ?? (sameSensor ? prev.model : null),
     maxdata: fullSensorData?.maxdata,
     data: fullSensorData?.data,
-    proto: fullSensorData?.proto === true,
+    proto: fullSensorData?.proto === true || (sameSensor && prev?.proto === true),
+    idbSensorType: sameSensor ? prev.idbSensorType : null,
   });
+};
 
 /** Shell device for `?owner=` without `sensor=` — does not affect picker bundle (full list). */
 const pickOwnerShellSensorId = async (owner, lat, lng) => {

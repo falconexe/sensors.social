@@ -1,5 +1,5 @@
 import { MARKER_CLASSES } from "../markers";
-import { getMapContext } from "../map";
+import { getMapContext, isMapReady } from "../map";
 import * as utils from "../markers";
 import { findMarker as findMarkerGeneral } from "../markers";
 import * as icons from "./icons";
@@ -14,9 +14,10 @@ import { hasValidCoordinates } from "../../utils";
  */
 export function isReadyLayer() {
   try {
+    if (!isMapReady()) return false;
     const ctx = getMapContext();
     return !!ctx.markersLayer;
-  } catch (error) {
+  } catch {
     return false;
   }
 }

@@ -28,15 +28,16 @@ export function resolveSensorType(point, logOverride = null) {
   const fromModel = sensorTypeFromDeviceModel(point.device_model);
   if (fromModel) return fromModel;
 
-  const log = logOverride ?? (Array.isArray(point?.logs) ? point.logs : null);
-  const fromLog = inferDeviceTypeFromLog(log);
-  if (fromLog) return fromLog;
-
   const sid = String(point.sensor_id || "");
   const fromBundle = Array.isArray(point.ownerSensorsWithData)
     ? point.ownerSensorsWithData.find((o) => String(o?.id || o?.sensor_id || "") === sid)?.type
     : null;
-  if (fromBundle) return fromBundle;
+  if (fromBundle === "insight" || fromBundle === "urban" || fromBundle === "diy") {
+    return fromBundle;
+  }
+
+  const cached = point.idbSensorType;
+  if (cached && cached !== "altruist") return cached;
 
   if (sid) {
     const meta = getCachedSensorMeta(sid);
@@ -49,8 +50,9 @@ export function resolveSensorType(point, logOverride = null) {
     }
   }
 
-  const cached = point.idbSensorType;
-  if (cached && cached !== "altruist") return cached;
+  const log = logOverride ?? (Array.isArray(point?.logs) ? point.logs : null);
+  const fromLog = inferDeviceTypeFromLog(log);
+  if (fromLog) return fromLog;
 
   return "altruist";
 }

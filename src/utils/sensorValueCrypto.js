@@ -18,6 +18,60 @@ export function isEncryptedSensorValue(value) {
   return typeof value === "string" && value.startsWith(ENCRYPTED_PREFIX);
 }
 
+/** Uint8Array from proto, IndexedDB, JSON `{0:n,…}`, or hex/SS58. */
+export function coerceBytes(value) {
+  if (value == null) return null;
+  if (value instanceof Uint8Array) return Uint8Array.from(value);
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  if (Array.isArray(value)) {
+    return Uint8Array.from(value.map((n) => Number(n) & 0xff));
+  }
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return null;
+    if (/^[0-9a-fA-F]+$/.test(text) && text.length % 2 === 0 && text.length >= 24) {
+      const out = new Uint8Array(text.length / 2);
+      for (let i = 0; i < out.length; i += 1) {
+        out[i] = parseInt(text.slice(i * 2, i * 2 + 2), 16);
+      }
+      return out;
+    }
+    return null;
+  }
+  if (typeof value === "object") {
+    const len = Number(value.length);
+    if (Number.isFinite(len) && len > 0) {
+      const out = new Uint8Array(len);
+      for (let i = 0; i < len; i += 1) out[i] = Number(value[i]) & 0xff;
+      return out;
+    }
+    const keys = Object.keys(value)
+      .filter((k) => /^\d+$/.test(k))
+      .map(Number)
+      .sort((a, b) => a - b);
+    if (keys.length > 0 && keys[0] === 0 && keys[keys.length - 1] === keys.length - 1) {
+      const out = new Uint8Array(keys.length);
+      for (let i = 0; i < keys.length; i += 1) out[i] = Number(value[i]) & 0xff;
+      return out;
+    }
+  }
+  return null;
+}
+
+function normalizeCpsAlgorithm(algorithm) {
+  const algo = String(algorithm || AESGCM256_ALGORITHM)
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_]+/g, "-");
+  if (!algo || algo === "aes-gcm" || algo === "aes-256-gcm" || algo === "aesgcm") {
+    return AESGCM256_ALGORITHM;
+  }
+  return algo === "aesgcm256" ? AESGCM256_ALGORITHM : algo;
+}
+
 function hasEncryptedFields(measurement) {
   if (!measurement || typeof measurement !== "object") return false;
   return Object.values(measurement).some(isEncryptedSensorValue);
@@ -96,21 +150,45 @@ async function decryptCpsValue(wire, ownerSeed) {
   }
 }
 
+async function publicKeyFromField(fromField) {
+  const bytes = coerceBytes(fromField);
+  if (bytes?.length === 32) return bytes;
+  if (bytes?.length > 32) {
+    try {
+      const asText = new TextDecoder().decode(bytes).replace(/\0+$/g, "").trim();
+      const fromSs58 = await resolveDevicePublicKey(asText);
+      if (fromSs58) return fromSs58;
+    } catch {
+      // not UTF-8 SS58 in bytes
+    }
+  }
+  return resolveDevicePublicKey(fromField);
+}
+
 /**
  * Decrypt a proto `crypto.v1.Encrypted` blob with `@sensors-social/crypto`.
  * @returns {Promise<Uint8Array|null>} plaintext bytes or null
  */
-export async function decryptCpsBinary({ from, nonce, ciphertext, algorithm, ownerAccount }) {
-  const algo = String(algorithm || AESGCM256_ALGORITHM).toLowerCase();
+export async function decryptCpsBinary({
+  from,
+  nonce,
+  ciphertext,
+  algorithm,
+  ownerAccount,
+  fallbackFrom,
+}) {
+  const algo = normalizeCpsAlgorithm(algorithm);
   if (algorithm && !SUPPORTED_ALGORITHMS.has(algo)) return null;
   const ownerSeed = await resolveOwnerSeed(ownerAccount);
   if (!ownerSeed) return null;
+  const nonceBytes = coerceBytes(nonce);
+  const cipherBytes = coerceBytes(ciphertext);
+  if (!nonceBytes?.length || !cipherBytes?.length) return null;
   const devicePk =
-    from instanceof Uint8Array && from.length === 32 ? from : await resolveDevicePublicKey(from);
-  if (!devicePk || !(nonce instanceof Uint8Array) || nonce.length === 0) return null;
-  if (!(ciphertext instanceof Uint8Array) || ciphertext.length === 0) return null;
+    (await publicKeyFromField(from)) || (await publicKeyFromField(fallbackFrom));
+  if (!devicePk) return null;
   try {
-    return decryptCpsBytes(ciphertext, nonce, devicePk, ownerSeed, algo);
+    return decryptCpsBytes(cipherBytes, nonceBytes, devicePk, ownerSeed, algo);
   } catch {
     return null;
   }

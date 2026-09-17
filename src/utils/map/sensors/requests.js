@@ -129,6 +129,8 @@ function protoPointsToHistory(points) {
       const ts = Number(point?.timestamp);
       if (!Number.isFinite(ts) || !point?.data || typeof point.data !== "object") return null;
       const entry = { timestamp: ts, data: point.data, proto: true };
+      if (point.device_model) entry.device_model = point.device_model;
+      if (point.owner) entry.owner = point.owner;
       if (
         point.geo &&
         Number.isFinite(Number(point.geo.lat)) &&
@@ -279,9 +281,18 @@ export function sensorTypeFromDeviceModel(deviceModel) {
   return null;
 }
 
+/** True for a real log metric: number or JSON `e.` ciphertext, not proto `e.proto` placeholders. */
+function logValueIsRealMeasurement(value) {
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "string") return false;
+  if (value === "e.proto") return false;
+  return value.startsWith("e.") && value.length > 2;
+}
+
 /**
  * Infer Urban vs Insight when Roseman omits device_model on bundle entries.
  * Insight: CO₂ without PM; Urban: PM and/or noise metrics.
+ * Synthetic proto placeholders (`e.proto`) must not flip Insight → Urban.
  */
 export function inferDeviceTypeFromLog(log) {
   if (!Array.isArray(log) || log.length === 0) return null;
@@ -291,7 +302,8 @@ export function inferDeviceTypeFromLog(log) {
   for (const item of sample) {
     const data = item?.data;
     if (!data || typeof data !== "object") continue;
-    for (const key of Object.keys(data)) {
+    for (const [key, value] of Object.entries(data)) {
+      if (!logValueIsRealMeasurement(value)) continue;
       keys.add(String(key).toLowerCase());
     }
   }
@@ -591,14 +603,25 @@ function isMaxDataMemoryValid(cached, isoDate, dayStart) {
 }
 
 function applyMaxValuesToSensors(sensors, unit, maxValues) {
+  const u = String(unit || "").toLowerCase();
   return sensors.map((sensor) => {
-    const entry = maxValues?.[sensor.sensor_id];
-    const value = entry ? (entry.value ?? null) : null;
+    const sid = String(sensor?.sensor_id || "");
+    const entry =
+      maxValues?.[sid] ||
+      maxValues?.[canonicalSensorId(sid)] ||
+      null;
+    const apiNum =
+      entry && entry.value != null && Number.isFinite(Number(entry.value))
+        ? Number(entry.value)
+        : null;
+    const prev = sensor?.maxdata?.[u];
+    const prevNum = typeof prev === "number" && Number.isFinite(prev) ? prev : null;
+    const value = apiNum != null ? apiNum : prevNum;
     return {
       ...sensor,
       maxdata: {
         ...sensor.maxdata,
-        [unit]: value,
+        [u]: value,
       },
     };
   });
@@ -762,17 +785,60 @@ export function maxdataHasMapGeo(values) {
 /** @deprecated use sortMapLayerUnits from measurements/tools */
 export const sortMeasurementUnits = sortMapLayerUnits;
 
-/** Collect measurement keys from sensors that are drawable on the map (realtime). */
+const URBAN_FOOTER_UNITS = [
+  "pm10",
+  "pm25",
+  "temperature",
+  "humidity",
+  "pressure",
+  "noisemax",
+  "noiseavg",
+];
+const INSIGHT_FOOTER_UNITS = ["temperature", "humidity", "pressure", "co2"];
+
+function addDeviceFooterTypes(sensor, types) {
+  const add = (model) => {
+    const t = sensorTypeFromDeviceModel(model);
+    if (t === "insight") types.add("insight");
+    if (t === "urban" || t === "altruist") types.add("urban");
+  };
+  add(sensor?.device_model);
+  add(sensor?.idbSensorType);
+  for (const row of Array.isArray(sensor?.ownerSensorsWithData) ? sensor.ownerSensorsWithData : []) {
+    add(row?.type || row?.device_model);
+  }
+  for (const entry of Array.isArray(sensor?.sensors) ? sensor.sensors : []) {
+    add(parseBundleSensorEntry(entry)?.device_model);
+  }
+}
+
+/** Measurement keys to offer in the footer: numeric, encrypted proto, and typical Urban/Insight set. */
 export function collectUnitsFromMapSensors(sensors) {
+  const allowed = new Set(mapLayerUnitIds());
   const units = new Set();
   for (const sensor of Array.isArray(sensors) ? sensors : []) {
     if (!hasValidCoordinates(sensor?.geo)) continue;
+    const types = new Set();
+    addDeviceFooterTypes(sensor, types);
+    if (sensor?.proto === true && types.size === 0) types.add("urban");
+    if (types.has("urban")) {
+      for (const unit of URBAN_FOOTER_UNITS) if (allowed.has(unit)) units.add(unit);
+    }
+    if (types.has("insight")) {
+      for (const unit of INSIGHT_FOOTER_UNITS) if (allowed.has(unit)) units.add(unit);
+    }
     for (const bag of [sensor?.data, sensor?.maxdata]) {
       if (!bag || typeof bag !== "object") continue;
       for (const [key, raw] of Object.entries(bag)) {
         const unit = String(key).toLowerCase();
-        if (!unit || raw === null || raw === undefined) continue;
-        units.add(unit);
+        if (!allowed.has(unit) || raw === null || raw === undefined) continue;
+        if (typeof raw === "number" && Number.isFinite(raw)) {
+          units.add(unit);
+          continue;
+        }
+        if (typeof raw === "string" && (raw.startsWith("e.") || Number.isFinite(Number(raw)))) {
+          units.add(unit);
+        }
       }
     }
   }
@@ -977,7 +1043,65 @@ export async function getSensors(start, end, provider = "remote", cacheContext =
     ? await loadMarkersListRaw(start, end, cacheContext.isoDate, cacheContext.timelineMode)
     : await REMOTE_PROVIDER.getSensorsForPeriod(start, end);
 
-  return markerRowsFromSensorData(await attachRosemanV3Proto(historyData, start, end));
+  const rows = markerRowsFromSensorData(historyData);
+  rows.sensors = await attachRosemanV3Proto(rows.sensors, start, end);
+  rows.sensorsNoLocation = await attachRosemanV3Proto(rows.sensorsNoLocation, start, end);
+  return rows;
+}
+
+function numericMeasurementBag(data) {
+  const out = {};
+  if (!data || typeof data !== "object") return out;
+  for (const [key, raw] of Object.entries(data)) {
+    const unit = String(key).toLowerCase();
+    if (!unit) continue;
+    if (typeof raw === "string" && raw.startsWith("e.")) continue;
+    const n = typeof raw === "number" ? raw : Number(raw);
+    if (Number.isFinite(n)) out[unit] = n;
+  }
+  return out;
+}
+
+function indexProtoLatestPoints(points) {
+  const byKey = new Map();
+  const remember = (key, point) => {
+    const id = String(key || "").trim();
+    if (!id) return;
+    const prev = byKey.get(id);
+    if (!prev || Number(point.timestamp || 0) >= Number(prev.timestamp || 0)) {
+      byKey.set(id, point);
+    }
+  };
+  for (const point of points) {
+    const sid = String(point?.sensor_id || "").trim();
+    if (!sid) continue;
+    remember(sid, point);
+    remember(canonicalSensorId(sid), point);
+    remember(sensorIdToHex(sid), point);
+    remember(sensorIdToSs58(sid), point);
+  }
+  return byKey;
+}
+
+function lookupProtoPoint(byKey, sensorId) {
+  const raw = String(sensorId || "").trim();
+  if (!raw) return null;
+  return (
+    byKey.get(raw) ||
+    byKey.get(canonicalSensorId(raw)) ||
+    byKey.get(sensorIdToHex(raw)) ||
+    byKey.get(sensorIdToSs58(raw)) ||
+    null
+  );
+}
+
+function mergeNumericMax(into, bag) {
+  for (const [unit, n] of Object.entries(bag || {})) {
+    const prev = into[unit];
+    if (typeof prev !== "number" || !Number.isFinite(prev) || n > prev) {
+      into[unit] = n;
+    }
+  }
 }
 
 async function attachRosemanV3Proto(sensors, start, end) {
@@ -1008,29 +1132,36 @@ async function attachRosemanV3Proto(sensors, start, end) {
 
   if (points.length === 0) return sensors;
 
-  const protoIds = new Set();
-  for (const point of points) {
-    const sid = String(point?.sensor_id || "").trim();
-    if (!sid) continue;
-    protoIds.add(sid);
-    const hex = sensorIdToHex(sid);
-    if (hex) protoIds.add(hex);
-    const ss58 = sensorIdToSs58(sid);
-    if (ss58) protoIds.add(ss58);
-  }
+  const byKey = indexProtoLatestPoints(points);
 
   return sensors.map((sensor) => {
-    const raw = String(sensor?.sensor_id || "").trim();
-    const hex = sensorIdToHex(raw);
-    const ss58 = sensorIdToSs58(raw);
-    if (
-      protoIds.has(raw) ||
-      (hex && protoIds.has(hex)) ||
-      (ss58 && protoIds.has(ss58))
-    ) {
-      return { ...sensor, proto: true };
+    const own = lookupProtoPoint(byKey, sensor?.sensor_id);
+    const siblingPoints = own ? [own] : [];
+    for (const entry of Array.isArray(sensor?.sensors) ? sensor.sensors : []) {
+      const sid = parseBundleSensorEntry(entry)?.sensor_id;
+      const point = lookupProtoPoint(byKey, sid);
+      if (point && !siblingPoints.includes(point)) siblingPoints.push(point);
     }
-    return sensor;
+    if (siblingPoints.length === 0) return sensor;
+
+    const nums = {};
+    for (const point of siblingPoints) {
+      mergeNumericMax(nums, numericMeasurementBag(point.data));
+    }
+    const maxdata = { ...(sensor.maxdata || {}) };
+    mergeNumericMax(maxdata, nums);
+    const latest = siblingPoints.reduce((a, b) =>
+      Number(b?.timestamp || 0) >= Number(a?.timestamp || 0) ? b : a
+    );
+
+    return {
+      ...sensor,
+      proto: true,
+      device_model: sensor.device_model || own?.device_model || null,
+      data: { ...(sensor.data || {}), ...nums },
+      maxdata,
+      timestamp: latest.timestamp || sensor.timestamp,
+    };
   });
 }
 
@@ -1263,12 +1394,49 @@ export function filterOwnerBundleNearAnchor(items, anchorGeo, activeSensorId, ma
       ? withGeo
       : withGeo.filter((o) => haversineKm(anchorGeo, o.geo) <= maxKm);
 
-  if (sid && !nearby.some((o) => String(o.id) === sid)) {
-    const self = list.find((o) => String(o.id) === sid);
-    if (self) return [self, ...nearby];
+  const nearbyIds = new Set(nearby.map((o) => String(o.id)));
+  const nearbyTypes = new Set(
+    nearby.map((o) => String(o?.type || "").toLowerCase()).filter(Boolean)
+  );
+  const declared = new Set();
+  if (sid) {
+    declared.add(sid);
+    const meta = getCachedSensorMeta(sid);
+    if (meta) {
+      for (const entry of listBundleSensorEntries(meta)) {
+        if (entry?.sensor_id) declared.add(String(entry.sensor_id));
+      }
+    }
+  }
+  const extras = [];
+  const extraTypeUsed = new Set();
+  for (const o of list) {
+    const id = String(o?.id || "");
+    if (!id || nearbyIds.has(id)) continue;
+    const t = String(o?.type || o?.device_model || "").toLowerCase();
+    const isInsight = t === "insight";
+    const isUrban = t === "urban" || t === "altruist";
+    if (!isInsight && !isUrban) continue;
+    const pairType = isInsight ? "insight" : "urban";
+    if (extraTypeUsed.has(pairType)) continue;
+    const keepDeclared = declared.has(id);
+    const keepPair =
+      (isInsight && (nearbyTypes.has("urban") || nearbyTypes.has("altruist"))) ||
+      (isUrban && nearbyTypes.has("insight"));
+    if (!keepDeclared && !keepPair) continue;
+    if (o?.geo && hasValidCoordinates(o.geo) && hasValidCoordinates(anchorGeo)) {
+      if (haversineKm(anchorGeo, o.geo) > maxKm) continue;
+    }
+    extras.push(o);
+    extraTypeUsed.add(pairType);
   }
 
-  return nearby;
+  let result = nearby;
+  if (sid && !result.some((o) => String(o.id) === sid)) {
+    const self = list.find((o) => String(o.id) === sid);
+    if (self) result = [self, ...result];
+  }
+  return extras.length ? [...result, ...extras] : result;
 }
 
 /**
@@ -1432,7 +1600,10 @@ export async function getSensorData(
         // v2 responded without owner meta — avoid duplicate owner workaround fetch this session.
         rosemanOwnerWorkaroundCache.set(String(sensorId), { owner: null, ts: Date.now() });
       }
-      const owner = normalizeOwnerKey(payload?.sensor);
+      const owner =
+        normalizeOwnerKey(payload?.sensor) ||
+        (Array.isArray(protoLogs) ? normalizeOwnerKey(protoLogs[0]) : "") ||
+        normalizeOwnerKey(getCachedSensorMeta(sensorId));
       if (Array.isArray(protoLogs) && protoLogs.length > 0) {
         return owner
           ? await decryptSensorHistoryEntries(sensorId, protoLogs, owner)
@@ -1561,7 +1732,7 @@ export async function fetchSensorCities() {
 
 const SENSOR_IDB_TTL = 24 * 60 * 60 * 1000; // 24 hours
 /** Bump when log shape changes (proto history) so stale IDB day caches are ignored. */
-const SENSOR_LOG_CACHE_GEN = 3;
+const SENSOR_LOG_CACHE_GEN = 4;
 
 function stripSensorCacheAddress(entry) {
   if (!entry || !("address" in entry)) return entry;

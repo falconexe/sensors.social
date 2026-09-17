@@ -5,7 +5,7 @@
 import L from "leaflet";
 import "leaflet.markercluster";
 import "leaflet.markercluster/dist/MarkerCluster.css";
-import { getMapContext, moveMap } from "./map";
+import { getMapContext, isMapReady, moveMap } from "./map";
 import { getMapAddressZoom } from "./defaultView";
 
 /**
@@ -231,9 +231,10 @@ export function attachClusterEvents(layer, clickHandler) {
  * @param {L.Marker} marker - Marker to center on
  */
 function centerMapOnMarker(marker) {
-  const coords = marker.getLatLng();
-  const zoom = getMapAddressZoom();
-  moveMap(coords, zoom, { popup: true, setZoom: true });
+  if (!marker || !isMapReady()) return;
+  const coords = marker.getLatLng?.();
+  if (!coords) return;
+  moveMap(coords, getMapAddressZoom(), { popup: true, setZoom: true });
 }
 
 /**
@@ -268,10 +269,16 @@ export function findMarker(markerId, type = "sensor") {
  * @param {string} markerId - ID маркера (sensor_id или message_id)
  * @param {string} type - Тип маркера: 'sensor' или 'message' (по умолчанию 'sensor')
  */
-export function setActiveMarker(markerId, type = "sensor") {
+export function setActiveMarker(markerId, type = "sensor", options = {}) {
   if (!markerId) return;
+  const center = options.center !== false;
 
-  const ctx = getMapContext();
+  let ctx;
+  try {
+    ctx = getMapContext();
+  } catch {
+    return;
+  }
   ctx.activeSensorMarkerId = type === "sensor" ? String(markerId) : null;
 
   // Определяем слой и поле ID в зависимости от типа
@@ -287,9 +294,8 @@ export function setActiveMarker(markerId, type = "sensor") {
   const marker = findMarker(markerId, type);
 
   if (marker) {
-    // Маркер найден, применяем активный класс
     applyActiveMarker(marker);
-    centerMapOnMarker(marker);
+    if (center) centerMapOnMarker(marker);
     return;
   }
 
@@ -298,10 +304,9 @@ export function setActiveMarker(markerId, type = "sensor") {
     const addedMarker = e.layer;
 
     if (addedMarker.options.data?.[idField] === markerId) {
-      // Нашли нужный маркер, отписываемся и применяем активный класс
       layer.off("layeradd", onLayerAdd);
       applyActiveMarker(addedMarker);
-      centerMapOnMarker(addedMarker);
+      if (center) centerMapOnMarker(addedMarker);
     }
   };
 

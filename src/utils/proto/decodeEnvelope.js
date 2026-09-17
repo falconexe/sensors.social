@@ -9,12 +9,20 @@ import {
   SignedEnvelopeSchema,
 } from "@buf/airalab_connectivity-protocol.bufbuild_es/crypto/v1/envelope_pb.js";
 import { MessageSchema } from "@buf/airalab_connectivity-protocol.bufbuild_es/core/v1/message_pb.js";
-import { EncryptedUrbanSchema } from "@buf/airalab_connectivity-protocol.bufbuild_es/device/v1/urban_pb.js";
-import { EncryptedInsightSchema } from "@buf/airalab_connectivity-protocol.bufbuild_es/device/v1/insight_pb.js";
+import {
+  EncryptedUrbanSchema,
+  UrbanSchema,
+  UrbanSensorSchema,
+} from "@buf/airalab_connectivity-protocol.bufbuild_es/device/v1/urban_pb.js";
+import {
+  EncryptedInsightSchema,
+  InsightSchema,
+  InsightSensorSchema,
+} from "@buf/airalab_connectivity-protocol.bufbuild_es/device/v1/insight_pb.js";
 import { ed25519 } from "@noble/curves/ed25519";
 import { encodeAddress } from "@polkadot/util-crypto";
 import { pressureToMmHg } from "../pressureMmHg";
-import { decryptCpsBinary, isEncryptedSensorValue } from "../sensorValueCrypto";
+import { coerceBytes, decryptCpsBinary, isEncryptedSensorValue } from "../sensorValueCrypto";
 
 function asU8(data) {
   if (data instanceof Uint8Array) {
@@ -106,13 +114,24 @@ function applyScd(measurement, data) {
   if (measurement.case === "co2") {
     const n = finite(measurement.value?.ppm);
     if (n != null) data.co2 = n;
-  } else if (measurement.case === "temperature") {
+    return;
+  }
+  if (measurement.case === "temperature") {
     const n = finite(measurement.value?.celsius);
     if (n != null) data.temperature = n;
-  } else if (measurement.case === "humidity") {
+    return;
+  }
+  if (measurement.case === "humidity") {
     const n = finite(measurement.value?.percent);
     if (n != null) data.humidity = n;
+    return;
   }
+  const ppm = finite(measurement.ppm) ?? finite(measurement.co2?.ppm);
+  if (ppm != null) data.co2 = ppm;
+  const celsius = finite(measurement.celsius) ?? finite(measurement.temperature?.celsius);
+  if (celsius != null) data.temperature = celsius;
+  const percent = finite(measurement.percent) ?? finite(measurement.humidity?.percent);
+  if (percent != null) data.humidity = percent;
 }
 
 function applyGps(gps, acc) {
@@ -124,10 +143,21 @@ function applyGps(gps, acc) {
   acc.geo = { lat, lng: lon };
 }
 
+function readSensorOneof(item) {
+  const oneof = item?.sensor;
+  if (oneof?.case) {
+    return { case: oneof.case, value: oneof.value };
+  }
+  for (const key of ["gps", "bme680", "scd41", "bme280", "sds011", "ics43434"]) {
+    if (item?.[key]) return { case: key, value: item[key] };
+  }
+  return null;
+}
+
 function foldSensors(items, kind) {
   const acc = { geo: null, measurement: {} };
   for (const item of items || []) {
-    const sensor = item?.sensor;
+    const sensor = readSensorOneof(item);
     if (!sensor?.case) {
       continue;
     }
@@ -168,12 +198,7 @@ function verifyEnvelope(env) {
 }
 
 function asBytes(value) {
-  if (value instanceof Uint8Array) return Uint8Array.from(value);
-  if (value instanceof ArrayBuffer) return new Uint8Array(value);
-  if (ArrayBuffer.isView(value)) {
-    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-  }
-  return null;
+  return coerceBytes(value);
 }
 
 const PROTO_ENCRYPTED_PLACEHOLDER = "e.proto";
@@ -195,6 +220,7 @@ function hasMeasurementValue(value) {
 
 /** Keep chart legend + login overlay for metrics sealed in private[] (same UX as JSON `e.`). */
 function fillProtoPrivatePlaceholders(data, kind) {
+  if (kind !== "insight" && kind !== "urban") return { ...(data || {}) };
   const keys = kind === "insight" ? INSIGHT_KEYS : URBAN_KEYS;
   const out = { ...(data || {}) };
   for (const key of keys) {
@@ -204,28 +230,66 @@ function fillProtoPrivatePlaceholders(data, kind) {
   return out;
 }
 
-function snapshotPrivate(items) {
+function snapshotPrivate(items, fallbackFrom = null) {
+  const fallback = asBytes(fallbackFrom);
   return (items || [])
     .map((enc) => ({
       version: enc.version,
-      algorithm: enc.algorithm,
-      from: asBytes(enc.from),
+      algorithm: String(enc.algorithm || "").trim(),
+      from: asBytes(enc.from) || fallback,
       nonce: asBytes(enc.nonce),
       ciphertext: asBytes(enc.ciphertext),
     }))
     .filter((enc) => enc.from && enc.nonce && enc.ciphertext);
 }
 
-function parseEncryptedSensors(plain, kind) {
-  try {
-    const msg =
-      kind === "insight"
-        ? fromBinary(EncryptedInsightSchema, plain)
-        : fromBinary(EncryptedUrbanSchema, plain);
-    return foldSensors(msg.sensors, kind);
-  } catch {
-    return { geo: null, measurement: {} };
+function foldedOrNull(folded, kind) {
+  if (!folded) return null;
+  if (!folded.geo && Object.keys(folded.measurement || {}).length === 0) return null;
+  return { ...folded, kind };
+}
+
+function knownPayloadKind(value) {
+  return value === "insight" || value === "urban" ? value : null;
+}
+
+function parseEncryptedSensors(plain, kindHint) {
+  const hint = knownPayloadKind(kindHint);
+  if (!plain || plain.length === 0) {
+    return { geo: null, measurement: {}, kind: hint };
   }
+  const order = hint === "urban" ? ["urban", "insight"] : ["insight", "urban"];
+  for (const kind of order) {
+    try {
+      const wrapper =
+        kind === "insight"
+          ? fromBinary(EncryptedInsightSchema, plain)
+          : fromBinary(EncryptedUrbanSchema, plain);
+      const folded = foldedOrNull(foldSensors(wrapper.sensors, kind), kind);
+      if (folded) return folded;
+    } catch {
+      // Wrong wrapper type.
+    }
+    try {
+      const payload =
+        kind === "insight" ? fromBinary(InsightSchema, plain) : fromBinary(UrbanSchema, plain);
+      const folded = foldedOrNull(foldSensors(payload.public, kind), kind);
+      if (folded) return folded;
+    } catch {
+      // Not a full Urban/Insight message.
+    }
+    try {
+      const one =
+        kind === "insight"
+          ? fromBinary(InsightSensorSchema, plain)
+          : fromBinary(UrbanSensorSchema, plain);
+      const folded = foldedOrNull(foldSensors([one], kind), kind);
+      if (folded) return folded;
+    } catch {
+      // Not a single sensor row.
+    }
+  }
+  return { geo: null, measurement: {}, kind: hint };
 }
 
 /**
@@ -241,23 +305,31 @@ export async function decryptProtoPrivate(point, ownerAccount) {
   const leftover = [];
   const extra = {};
   let geo = point.geo || null;
+  let kind = knownPayloadKind(point.device_model);
+  const fallbackFrom = point.sensor_id;
   for (const enc of point.protoPrivate) {
-    const plain = await decryptCpsBinary({ ...enc, ownerAccount });
+    const plain = await decryptCpsBinary({ ...enc, ownerAccount, fallbackFrom });
     if (!plain) {
       leftover.push(enc);
       continue;
     }
-    const folded = parseEncryptedSensors(plain, point.device_model === "insight" ? "insight" : "urban");
+    const folded = parseEncryptedSensors(plain, kind);
+    if (!folded.geo && Object.keys(folded.measurement).length === 0) {
+      leftover.push(enc);
+      continue;
+    }
+    kind = knownPayloadKind(folded.kind) || kind;
     Object.assign(extra, folded.measurement);
     if (!geo && folded.geo) geo = folded.geo;
   }
-  const kind = point.device_model === "insight" ? "insight" : "urban";
   const data = { ...(point.data || {}), ...extra };
+  const stillPending = leftover.length > 0;
   return {
     ...point,
     geo,
-    data: leftover.length > 0 ? fillProtoPrivatePlaceholders(data, kind) : data,
-    protoPrivate: leftover.length > 0 ? leftover : null,
+    device_model: kind || point.device_model || null,
+    data: stillPending ? fillProtoPrivatePlaceholders(data, kind) : data,
+    protoPrivate: stillPending ? leftover : null,
   };
 }
 
@@ -294,7 +366,7 @@ function envelopeToPoint(env, opts = {}) {
   if (!sensor_id) {
     return fail("bad-sensor-id");
   }
-  const protoPrivate = snapshotPrivate(payload?.private);
+  const protoPrivate = snapshotPrivate(payload?.private, env.sensorId);
   if (Object.keys(folded.measurement).length === 0 && protoPrivate.length === 0) {
     return fail("no-measurements");
   }

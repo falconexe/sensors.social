@@ -183,6 +183,10 @@ const handleTimelineModeChange = (mode) => {
     mapState.setTimelineMode(mode, activeSensorId);
     rebundleMap();
     if (activeSensorId) {
+      void sensorsUI?.hydrateOwnerBundleFromUserSensors?.(activeSensorId).then(() => {
+        if (markerGen !== timelineMarkerGen) return;
+        rebundleMap();
+      });
       void sensorsUI.updateSensorLogs(activeSensorId).then((result) => {
         if (!result?.ok || result.superseded) return;
         if (markerGen !== timelineMarkerGen) return;
