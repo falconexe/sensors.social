@@ -9,16 +9,48 @@ import Markdown from "unplugin-vue-markdown/vite";
 import { defineConfig, transformWithEsbuild } from "vite";
 import fg from "fast-glob";
 
-const CRYPTO_SRC = "/node_modules/@sensors-social/crypto/packages/crypto/";
+function findSensorsSocialCryptoDir() {
+  const candidates = [
+    fileURLToPath(new URL("./node_modules/@sensors-social/crypto/packages/crypto/", import.meta.url)),
+    fileURLToPath(new URL("./node_modules/@sensors-social/crypto/", import.meta.url)),
+  ];
+  for (const dir of candidates) {
+    if (fs.existsSync(path.join(dir, "src", "aesgcm.ts"))) return dir;
+  }
+  return null;
+}
+
+const CRYPTO_DIR = findSensorsSocialCryptoDir();
+const CRYPTO_SRC = (CRYPTO_DIR || "").replace(/\\/g, "/");
+const CRYPTO_SRC_ALIAS = CRYPTO_DIR
+  ? path.resolve(CRYPTO_DIR, "src").replace(/\\/g, "/")
+  : null;
+
+function resolveCryptoSource(id) {
+  const match = id.match(/^@sensors-social\/crypto\/(?:packages\/crypto\/)?src\/(.+)$/);
+  if (!match || !CRYPTO_DIR) return null;
+  const target = path.resolve(CRYPTO_DIR, "src", match[1]);
+  if (fs.existsSync(target)) return target;
+  if (fs.existsSync(`${target}.ts`)) return `${target}.ts`;
+  return null;
+}
+
+function isCryptoPackageFile(file) {
+  const normalized = file.replace(/\\/g, "/");
+  if (CRYPTO_SRC && normalized.includes(CRYPTO_SRC)) return true;
+  return normalized.includes("/node_modules/@sensors-social/crypto/");
+}
 
 function sensorsSocialCrypto() {
   return {
     name: "sensors-social-crypto",
     enforce: "pre",
     async resolveId(id, importer) {
+      const cryptoFile = resolveCryptoSource(id);
+      if (cryptoFile) return cryptoFile;
       if (!importer) return null;
       const from = importer.split("?")[0].replace(/\\/g, "/");
-      if (!from.includes(CRYPTO_SRC)) return null;
+      if (!isCryptoPackageFile(from)) return null;
       if (id.startsWith("@noble/curves/")) {
         return this.resolve(`sensors-social-noble-curves${id.slice("@noble/curves".length)}`, importer, {
           skipSelf: true,
@@ -33,7 +65,7 @@ function sensorsSocialCrypto() {
     },
     async transform(code, id) {
       const file = id.split("?")[0].replace(/\\/g, "/");
-      if (!file.includes(CRYPTO_SRC) || !file.endsWith(".ts")) return null;
+      if (!isCryptoPackageFile(file) || !file.endsWith(".ts")) return null;
       return transformWithEsbuild(code, id, {
         loader: "ts",
         format: "esm",
@@ -110,6 +142,18 @@ export default defineConfig(() => {
     ],
     resolve: {
       alias: [
+        ...(CRYPTO_SRC_ALIAS
+          ? [
+              {
+                find: /^@sensors-social\/crypto\/packages\/crypto\/src\/(.*)$/,
+                replacement: `${CRYPTO_SRC_ALIAS}/$1`,
+              },
+              {
+                find: /^@sensors-social\/crypto\/src\/(.*)$/,
+                replacement: `${CRYPTO_SRC_ALIAS}/$1`,
+              },
+            ]
+          : []),
         {
           find: /^@sensors-social\/crypto$/,
           replacement: fileURLToPath(new URL("./src/utils/sensorsSocialCrypto.js", import.meta.url)),
