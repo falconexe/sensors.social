@@ -1,15 +1,47 @@
 import { fileURLToPath, URL } from "node:url";
+import fs from "fs";
+import fsp from "fs/promises";
+import path from "path";
 
 import prerender from "@prerenderer/rollup-plugin";
 import vue from "@vitejs/plugin-vue";
-import { defineConfig } from "vite";
-
-// for blog
-import Markdown from 'unplugin-vue-markdown/vite'
-import fs from "fs"
-import path from "path"
-import fsp from "fs/promises";
+import Markdown from "unplugin-vue-markdown/vite";
+import { defineConfig, transformWithEsbuild } from "vite";
 import fg from "fast-glob";
+
+const CRYPTO_SRC = "/node_modules/@sensors-social/crypto/packages/crypto/";
+
+function sensorsSocialCrypto() {
+  return {
+    name: "sensors-social-crypto",
+    enforce: "pre",
+    async resolveId(id, importer) {
+      if (!importer) return null;
+      const from = importer.split("?")[0].replace(/\\/g, "/");
+      if (!from.includes(CRYPTO_SRC)) return null;
+      if (id.startsWith("@noble/curves/")) {
+        return this.resolve(`sensors-social-noble-curves${id.slice("@noble/curves".length)}`, importer, {
+          skipSelf: true,
+        });
+      }
+      if (id.startsWith("@noble/hashes/")) {
+        return this.resolve(`sensors-social-noble-hashes${id.slice("@noble/hashes".length)}`, importer, {
+          skipSelf: true,
+        });
+      }
+      return null;
+    },
+    async transform(code, id) {
+      const file = id.split("?")[0].replace(/\\/g, "/");
+      if (!file.includes(CRYPTO_SRC) || !file.endsWith(".ts")) return null;
+      return transformWithEsbuild(code, id, {
+        loader: "ts",
+        format: "esm",
+        tsconfigRaw: { compilerOptions: { target: "es2020" } },
+      });
+    },
+  };
+}
 
 function getBlogRoutes() {
   const postsDir = path.resolve(__dirname, "src/blog")
@@ -21,12 +53,12 @@ function getBlogRoutes() {
     .map((entry) => `/blog/${entry.name}`)
 }
 
-// https://vitejs.dev/config/
 export default defineConfig(() => {
   return {
     base: "/",
     // server: { https: true },
     plugins: [
+      sensorsSocialCrypto(),
       vue({include: [/\.vue$/, /\.md$/]}),
       {
         name: "copy-blog-images",
@@ -77,10 +109,14 @@ export default defineConfig(() => {
       })
     ],
     resolve: {
-      alias: {
-        "@": fileURLToPath(new URL("./src", import.meta.url)),
-        "@config": fileURLToPath(new URL("./src/config", import.meta.url)),
-      },
+      alias: [
+        {
+          find: /^@sensors-social\/crypto$/,
+          replacement: fileURLToPath(new URL("./src/utils/sensorsSocialCrypto.js", import.meta.url)),
+        },
+        { find: "@", replacement: fileURLToPath(new URL("./src", import.meta.url)) },
+        { find: "@config", replacement: fileURLToPath(new URL("./src/config", import.meta.url)) },
+      ],
     },
     build: {
       target: ["es2020"],
@@ -89,7 +125,9 @@ export default defineConfig(() => {
       esbuildOptions: {
         target: ["es2020"],
       },
+      exclude: ["@sensors-social/crypto"],
       include: [
+        "@bufbuild/protobuf",
         "@fortawesome/fontawesome-svg-core",
         "@fortawesome/free-brands-svg-icons",
         "@fortawesome/free-regular-svg-icons",

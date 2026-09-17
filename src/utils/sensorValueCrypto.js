@@ -1,21 +1,18 @@
-import { x25519 } from "@noble/curves/ed25519";
-import { hkdf } from "@noble/hashes/hkdf";
-import { sha256 } from "@noble/hashes/sha256";
-import { sha512 } from "@noble/hashes/sha512";
+import {
+  AESGCM256_ALGORITHM,
+  decryptAesGcm256,
+  decryptXChaCha20Poly1305,
+  XCHACHA20POLY1305_ALGORITHM,
+} from "@sensors-social/crypto";
 import bs58 from "bs58";
 
 import { cryptoWaitReady, decodeAddress, mnemonicToMiniSecret } from "@polkadot/util-crypto";
 import { getOwnerEd25519Seed } from "@/composables/useAccounts";
 import { MEASUREMENT_GROUPS } from "../measurements/groups";
+import { pressureToMmHg } from "./pressureMmHg";
 
 const ENCRYPTED_PREFIX = "e.";
-const HKDF_SALT = "robonomics-network";
-const HKDF_INFO = "aesgcm256";
-const PASCAL_TO_MMHG = 133.32;
-
-const FIELD_PASCAL_THRESHOLD = 3000;
-
-const P = (1n << 255n) - 19n;
+const SUPPORTED_ALGORITHMS = new Set([AESGCM256_ALGORITHM, XCHACHA20POLY1305_ALGORITHM]);
 
 export function isEncryptedSensorValue(value) {
   return typeof value === "string" && value.startsWith(ENCRYPTED_PREFIX);
@@ -35,82 +32,15 @@ function base64ToBytes(b64) {
   return out;
 }
 
-function bytesToBigIntLE(bytes) {
-  let value = 0n;
-  for (let i = bytes.length - 1; i >= 0; i -= 1) {
-    value = (value << 8n) | BigInt(bytes[i]);
-  }
-  return value;
-}
-
-function bigIntToBytesLE(value, len = 32) {
-  const out = new Uint8Array(len);
-  let v = value;
-  for (let i = 0; i < len; i += 1) {
-    out[i] = Number(v & 0xffn);
-    v >>= 8n;
-  }
-  return out;
-}
-
-function modPow(base, exp, mod) {
-  let result = 1n;
-  let b = base % mod;
-  let e = exp;
-  while (e > 0n) {
-    if (e & 1n) result = (result * b) % mod;
-    b = (b * b) % mod;
-    e >>= 1n;
-  }
-  return result;
-}
-
-function modInv(a, mod) {
-  return modPow(a, mod - 2n, mod);
-}
-
-/** Ed25519 compressed public key -> X25519 Montgomery u (RFC 7748 / libcps). */
-function ed25519PublicToX25519(edPk) {
-  const yLe = new Uint8Array(edPk);
-  yLe[31] &= 0x7f;
-  const y = bytesToBigIntLE(yLe);
-  const one = 1n;
-  const num = (one + y) % P;
-  const den = (one - y + P) % P;
-  const u = (num * modInv(den, P)) % P;
-  return bigIntToBytesLE(u, 32);
-}
-
-function ed25519SeedToX25519Scalar(seed) {
-  const hash = sha512(seed);
-  const scalar = hash.slice(0, 32);
-  scalar[0] &= 248;
-  scalar[31] &= 127;
-  scalar[31] |= 64;
-  return scalar;
-}
-
-function deriveSharedSecret(ownerSeed, deviceEdPk) {
-  const scalar = ed25519SeedToX25519Scalar(ownerSeed);
-  const theirX = ed25519PublicToX25519(deviceEdPk);
-  return x25519.getSharedSecret(scalar, theirX);
-}
-
-function hkdfAesGcmKey(shared) {
-  return hkdf(sha256, shared, HKDF_SALT, HKDF_INFO, 32);
-}
-
-async function importAesGcmKey(rawKey) {
-  return crypto.subtle.importKey("raw", rawKey, { name: "AES-GCM" }, false, ["decrypt"]);
-}
-
 function parseCpsPayload(wire) {
   try {
     const raw = base64ToBytes(wire.slice(ENCRYPTED_PREFIX.length));
     const text = new TextDecoder().decode(raw);
     if (!text.startsWith("{")) return null;
     const json = JSON.parse(text);
-    if (json?.version !== 1 || json?.algorithm !== "aesgcm256") return null;
+    if (json?.version !== 1 || !SUPPORTED_ALGORITHMS.has(String(json?.algorithm || ""))) {
+      return null;
+    }
     return json;
   } catch {
     return null;
@@ -136,6 +66,17 @@ async function resolveDevicePublicKey(fromField) {
   return null;
 }
 
+function decryptCpsBytes(ciphertext, nonce, senderPublicKey, ownerSeed, algorithm) {
+  const algo = String(algorithm || AESGCM256_ALGORITHM).toLowerCase();
+  if (algo === AESGCM256_ALGORITHM) {
+    return decryptAesGcm256(ciphertext, nonce, senderPublicKey, ownerSeed);
+  }
+  if (algo === XCHACHA20POLY1305_ALGORITHM) {
+    return decryptXChaCha20Poly1305(ciphertext, nonce, senderPublicKey, ownerSeed);
+  }
+  return null;
+}
+
 async function decryptCpsValue(wire, ownerSeed) {
   const json = parseCpsPayload(wire);
   if (!json?.from || !json?.nonce || !json?.ciphertext) return null;
@@ -143,15 +84,33 @@ async function decryptCpsValue(wire, ownerSeed) {
   const devicePk = await resolveDevicePublicKey(json.from);
   if (!devicePk) return null;
 
-  const shared = deriveSharedSecret(ownerSeed, devicePk);
-  const aesKey = hkdfAesGcmKey(shared);
   const nonce = base64ToBytes(json.nonce);
   const ciphertext = base64ToBytes(json.ciphertext);
 
   try {
-    const key = await importAesGcmKey(aesKey);
-    const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, key, ciphertext);
-    return new TextDecoder().decode(new Uint8Array(plain));
+    const plain = decryptCpsBytes(ciphertext, nonce, devicePk, ownerSeed, json.algorithm);
+    if (!plain) return null;
+    return new TextDecoder().decode(plain);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Decrypt a proto `crypto.v1.Encrypted` blob with `@sensors-social/crypto`.
+ * @returns {Promise<Uint8Array|null>} plaintext bytes or null
+ */
+export async function decryptCpsBinary({ from, nonce, ciphertext, algorithm, ownerAccount }) {
+  const algo = String(algorithm || AESGCM256_ALGORITHM).toLowerCase();
+  if (algorithm && !SUPPORTED_ALGORITHMS.has(algo)) return null;
+  const ownerSeed = await resolveOwnerSeed(ownerAccount);
+  if (!ownerSeed) return null;
+  const devicePk =
+    from instanceof Uint8Array && from.length === 32 ? from : await resolveDevicePublicKey(from);
+  if (!devicePk || !(nonce instanceof Uint8Array) || nonce.length === 0) return null;
+  if (!(ciphertext instanceof Uint8Array) || ciphertext.length === 0) return null;
+  try {
+    return decryptCpsBytes(ciphertext, nonce, devicePk, ownerSeed, algo);
   } catch {
     return null;
   }
@@ -162,14 +121,12 @@ function normalizeDecryptedField(fieldName, plain) {
   if (!Number.isFinite(num)) return plain;
 
   const field = String(fieldName || "").toLowerCase();
-  if (field === "pressure" && num >= FIELD_PASCAL_THRESHOLD) {
-    return num / PASCAL_TO_MMHG;
-  }
+  if (field === "pressure") return pressureToMmHg(num);
   return num;
 }
 
 async function decryptSensorValue(wire, ownerSeed) {
-  if (!isEncryptedSensorValue(wire)) return null;
+  if (!isEncryptedSensorValue(wire) || wire === "e.proto") return null;
   return decryptCpsValue(wire, ownerSeed);
 }
 
@@ -227,6 +184,59 @@ export async function decryptMeasurementBag(sensorId, measurement, ownerAccount)
 
 export function measurementBagHasEncryptedValues(measurement) {
   return hasEncryptedFields(measurement);
+}
+
+export function hasPendingProtoPrivate(point) {
+  return Array.isArray(point?.protoPrivate) && point.protoPrivate.length > 0;
+}
+
+function isPlainNumber(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+/** Overlay `incoming` onto `existing`. Keep public numbers; fill missing / encrypted JSON fields proto skipped. */
+export function mergeMeasurementBags(existing, incoming) {
+  const left = existing && typeof existing === "object" ? existing : {};
+  const right = incoming && typeof incoming === "object" ? incoming : {};
+  const out = { ...left };
+  for (const [key, value] of Object.entries(right)) {
+    const prev = out[key];
+    const prevPlain = isPlainNumber(prev);
+    const nextPlain = isPlainNumber(value);
+    const prevEnc = isEncryptedSensorValue(prev);
+    const nextEnc = isEncryptedSensorValue(value);
+    if (prevPlain && nextEnc) continue;
+    if (prevEnc && nextPlain) {
+      out[key] = value;
+      continue;
+    }
+    if (prev === undefined || prev === null) {
+      out[key] = value;
+      continue;
+    }
+    if (nextPlain || (!prevPlain && nextEnc)) out[key] = value;
+  }
+  return out;
+}
+
+/** Same keys/values (numbers within 1e-4). Used to drop floodsub/JSON+proto duplicates. */
+export function measurementBagsEqual(a, b) {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== "object" || typeof b !== "object") return a == b;
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+  if (keysA.length !== keysB.length) return false;
+  for (const key of keysA) {
+    if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
+    const av = a[key];
+    const bv = b[key];
+    if (isPlainNumber(av) && isPlainNumber(bv)) {
+      if (Math.abs(av - bv) > 1e-4) return false;
+      continue;
+    }
+    if (av !== bv) return false;
+  }
+  return true;
 }
 
 function legendMemberIds(legendKey) {

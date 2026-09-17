@@ -1,4 +1,5 @@
 import { toFixed } from "./tools";
+import { pressureToMmHg } from "../utils/pressureMmHg";
 
 export default {
   label: "Pr",
@@ -46,7 +47,7 @@ export default {
     },
   ],
   calculate: function (v) {
-    return toFixed(v);
+    return toFixed(pressureToMmHg(v), 3);
   },
 
   description: [

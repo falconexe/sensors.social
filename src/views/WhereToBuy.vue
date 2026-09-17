@@ -34,7 +34,10 @@
       <span class="pinout__brand">
         <img class="pinout__mark" :src="pinout.image" alt="pinout logo" />
       </span>
-      <span class="pinout__link">{{ pinout.label }}</span>
+      <div class="pinout__links">
+        <span class="pinout__link">{{ pinout.label1 }}</span> <br />
+        <span class="pinout__link">{{ pinout.label2 }}</span>
+      </div>
     </a>
   </PageTextLayout>
 </template>
@@ -114,18 +117,18 @@ const products = computed(() =>
 
 const pinout = computed(() => ({
   name: "Pinout",
-  href: "https://pinout.cloud/",
+  href: "https://pinout.cloud/shop/altruist-and-purifiers",
   image: pinoutLogo,
-  label: t("Altruist Air Quality Sensors with Installation & Setup on Cyprus"),
+  label1: t("Altruist Air Quality Sensors "),
+  label2: t("with Installation & Setup on Cyprus"),
 }));
 </script>
 
 <style scoped>
 .catalog {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  column-gap: calc(var(--gap) * 3);
-  row-gap: calc(var(--gap) * 1.8);
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--gap);
   margin-top: calc(var(--gap) * 0.5);
   margin-bottom: calc(var(--gap) * 1.5) !important;
 }
@@ -133,8 +136,6 @@ const pinout = computed(() => ({
 .product__media {
   display: grid;
   place-items: center;
-  min-height: 280px;
-  padding: calc(var(--gap) * 1.15) calc(var(--gap) * 1.4);
   background: var(--color-light-gray-shop);
   border-radius: 10px;
 }
@@ -149,7 +150,7 @@ const pinout = computed(() => ({
 
 .product__title {
   margin: calc(var(--gap) * 0.85) 0 0;
-  font-size: calc(var(--font-size) * 1.5);
+  font-size: calc(var(--font-size) * 1.2);
   font-weight: 900;
   text-align: center;
   color: var(--color-dark);
@@ -169,6 +170,7 @@ const pinout = computed(() => ({
 .product__links a {
   display: block;
   padding: 0.55rem 0.4rem;
+  font-size: calc(var(--font-size) * 0.8);
   text-align: center;
   color: var(--color-link);
   text-decoration: none;
@@ -182,9 +184,10 @@ const pinout = computed(() => ({
 .pinout {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: calc(var(--gap) * 1.2);
   margin-top: calc(var(--gap) * 2);
-  padding: 0.95rem 1.25rem;
+  padding: var(--gap);
   border: 2px solid var(--color-dark);
   border-radius: 10px;
   background: var(--color-light);
@@ -216,8 +219,7 @@ const pinout = computed(() => ({
 
 .pinout__link {
   margin-left: auto;
-  font-size: calc(var(--font-size) * 1.3);
-  color: var(--color-link);
+  font-size: calc(var(--font-size) * 1);
   font-weight: 600;
 }
 
@@ -228,8 +230,7 @@ const pinout = computed(() => ({
 
 @media (max-width: 900px) {
   .catalog {
-    grid-template-columns: 1fr;
-    column-gap: 0;
+    grid-template-columns: repeat(2, 1fr);
   }
 
   .pinout {
@@ -238,9 +239,13 @@ const pinout = computed(() => ({
 
   .pinout__link {
     flex: 1 1 100%;
-    text-align: left;
     margin-left: 0;
-    font-size: calc(var(--font-size) * 1);
+  }
+}
+
+@media screen and (max-width: 710px) {
+  .pinout__brand {
+    max-width: 120px;
   }
 }
 </style>

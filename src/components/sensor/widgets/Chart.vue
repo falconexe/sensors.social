@@ -41,6 +41,7 @@
     <div class="chart-section-chart">
       <div class="chart-wrapper">
         <Chart ref="chartRef" constructor-type="stockChart" :options="chartOptions" />
+        <slot name="plot-overlay" />
       </div>
 
       <div class="custom-legend">
@@ -58,7 +59,7 @@
 </template>
 
 <script setup>
-import { ref, watch, computed, nextTick, onMounted, watchEffect } from "vue";
+import { ref, watch, computed, nextTick, onMounted, onUnmounted, watchEffect } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useI18n } from "vue-i18n";
 import Highcharts from "highcharts";
@@ -171,7 +172,11 @@ const activeLegendKey = computed(() => {
   const currentGroup = GROUPS_LOOKUP[cur];
   if (currentGroup && visibleLegend.value.some((x) => x.key === currentGroup)) return currentGroup;
 
-  if (!currentGroup && UNITS_FOUND.value.has(cur) && visibleLegend.value.some((x) => x.key === cur)) {
+  if (
+    !currentGroup &&
+    UNITS_FOUND.value.has(cur) &&
+    visibleLegend.value.some((x) => x.key === cur)
+  ) {
     return cur;
   }
 
@@ -191,6 +196,17 @@ const isRealtime = computed(() => mapState.timelineMode.value === "realtime");
 // Получаем экземпляр Highcharts для работы с графиком
 const chart = computed(() => chartRef.value?.chart);
 
+/** Navigator/internal series live in chart.series; never remove or diff them. */
+function isMainChartSeries(s, chartInstance) {
+  if (!s) return false;
+  if (s.isInternal) return false;
+  const mainX = chartInstance?.xAxis?.[0];
+  if (mainX && s.xAxis && s.xAxis !== mainX) return false;
+  const id = s.options?.id || s.userOptions?.id || "";
+  if (typeof id === "string" && String(id).includes("navigator")) return false;
+  return Boolean(s.options);
+}
+
 const unitsExpanded = ref(false);
 
 const toggleUnits = () => {
@@ -200,6 +216,19 @@ const toggleUnits = () => {
 // Флаг для предотвращения конкурирующих обновлений графика
 const isUpdatingChart = ref(false);
 
+const REALTIME_CHART_DEBOUNCE_MS = 500;
+let realtimeChartTimer = null;
+function queueRealtimeChartUpdate(log, legendKey) {
+  if (realtimeChartTimer) clearTimeout(realtimeChartTimer);
+  realtimeChartTimer = setTimeout(() => {
+    realtimeChartTimer = null;
+    updateChart(log, legendKey);
+  }, REALTIME_CHART_DEBOUNCE_MS);
+}
+onUnmounted(() => {
+  if (realtimeChartTimer) clearTimeout(realtimeChartTimer);
+});
+
 // Вычисляем уникальные единицы измерения для осей Y
 const uniqueUnits = computed(() => [...new Set(chartSeries.value.map((s) => s.unit))]);
 
@@ -208,7 +237,6 @@ const unitToAxisMapping = computed(() =>
   Object.fromEntries(uniqueUnits.value.map((unit, index) => [unit, index]))
 );
 
-// Подготавливаем серии с назначенными осями Y
 const preparedSeries = computed(() =>
   chartSeries.value.map((series) => ({
     ...series,
@@ -220,7 +248,7 @@ const preparedSeries = computed(() =>
 const yAxisConfig = computed(() =>
   uniqueUnits.value.map((unit) => ({
     title: false,
-    labels: { format: `{value} ${unit}` },
+    labels: { format: unit === "mmHg" ? `{value:.3f} ${unit}` : `{value} ${unit}` },
     opposite: true,
     visible: true,
   }))
@@ -564,37 +592,35 @@ const updateChart = async (log, legendKey = null) => {
         a.name.localeCompare(b.name)
       );
 
-      // Обновляем chartSeries для реактивности
-      chartSeries.value = raw;
+      // Обновляем chartSeries для реактивности.
+      const seriesMetaKey = (arr) =>
+        (arr || []).map((s) => `${s.id}:${s.unit}:${s.name}`).join("|");
+      if (seriesMetaKey(chartSeries.value) !== seriesMetaKey(raw)) {
+        chartSeries.value = raw;
+      }
 
       // Сохраняем состояние видимости серий
       const prevVis = {};
       chart.value.series.forEach((s) => {
-        if (s.options) {
+        if (isMainChartSeries(s, chart.value)) {
           prevVis[s.options.id] = s.visible;
         }
       });
 
       // Удаляем серии, которых больше нет
       chart.value.series.slice().forEach((s) => {
-        if (s.options && !raw.find((ns) => ns.id === s.options.id)) {
+        if (!isMainChartSeries(s, chart.value)) return;
+        if (!raw.find((ns) => ns.id === s.options.id)) {
           s.remove(false);
         }
       });
 
       let maxTime = 0;
+      let mutated = false;
       raw.forEach((ns) => {
         const existing = chart.value.get(ns.id);
         if (existing) {
-          existing.update(
-            {
-              name: ns.name,
-              zones: ns.zones,
-              dataGrouping: ns.dataGrouping,
-            },
-            false
-          );
-          if (typeof prevVis[ns.id] === "boolean") {
+          if (typeof prevVis[ns.id] === "boolean" && existing.visible !== prevVis[ns.id]) {
             existing.setVisible(prevVis[ns.id], false);
           }
 
@@ -604,33 +630,46 @@ const updateChart = async (log, legendKey = null) => {
           if (existing.data.length === 0) {
             existing.setData(ns.data, false, false, false);
             maxTime = Math.max(maxTime, ns.data.at(-1)?.[0] || 0);
+            mutated = true;
           } else if (newPoints.length > 0) {
             newPoints.forEach((p) => {
               existing.addPoint(p, false, false);
               maxTime = Math.max(maxTime, p[0]);
             });
+            mutated = true;
           } else if (ns.data.length !== existing.data.length) {
             existing.setData(ns.data, false, false, false);
             maxTime = Math.max(maxTime, ns.data.at(-1)?.[0] || 0);
+            mutated = true;
           }
         } else {
           chart.value.addSeries({ ...ns, visible: true }, false);
           const pts = chart.value.get(ns.id).data;
           maxTime = Math.max(maxTime, pts.at(-1)?.x || 0);
+          mutated = true;
         }
       });
 
       // Обновляем временную шкалу для realtime
       if (maxTime) {
-        chart.value.xAxis[0].setExtremes(
-          maxTime - REALTIME_VIEW_TIMELINE_MS,
-          maxTime,
-          false,
-          false
-        );
+        const xAxis = chart.value.xAxis[0];
+        const nextMin = maxTime - REALTIME_VIEW_TIMELINE_MS;
+        const curMin = xAxis.min;
+        const curMax = xAxis.max;
+        const extremesMoved =
+          !Number.isFinite(curMin) ||
+          !Number.isFinite(curMax) ||
+          Math.abs(curMax - maxTime) > 1000 ||
+          Math.abs(curMin - nextMin) > 1000;
+        if (extremesMoved) {
+          xAxis.setExtremes(nextMin, maxTime, false, false);
+          mutated = true;
+        }
       }
 
-      chart.value.redraw(false);
+      if (mutated) {
+        chart.value.redraw(false);
+      }
     } else {
       // Remote режим: полное обновление графика
       const all = buildSeriesArray(log, currentLegendKey);
@@ -847,7 +886,11 @@ function buildSeriesArray(log, legendKey) {
         }
 
         const seriesEntry = seriesCollection.get(paramId);
-        const numericValue = Number(paramValue);
+        const numericValue = Number(
+          paramId === "pressure" && typeof paramSettings.calculate === "function"
+            ? paramSettings.calculate(paramValue)
+            : paramValue
+        );
 
         if (
           gapThresholdMs &&
@@ -1022,9 +1065,9 @@ function applySeriesDiffToChart(chartInstance, newSeries) {
     if (s && s.options) prevVis[s.options.id] = s.visible;
   });
 
-  // Remove series that are no longer present
   (chartInstance.series || []).slice().forEach((s) => {
-    if (s && s.options && !raw.find((ns) => ns.id === s.options.id)) {
+    if (!isMainChartSeries(s, chartInstance)) return;
+    if (!raw.find((ns) => ns.id === s.options.id)) {
       s.remove(false);
     }
   });
@@ -1167,55 +1210,31 @@ watch(
   ) => {
     if (!chartRef.value || isUpdatingChart.value) return;
 
-    // Мгновенно очищаем график при переключении режимов таймлайна, даты или легенды
-    if (
+    const structuralChange =
       timelineMode !== oldTimelineMode ||
       currentDate !== oldCurrentDate ||
-      legendKey !== oldLegendKey ||
-      logRevision !== oldLogRevision
-    ) {
+      legendKey !== oldLegendKey;
+    const revisionChanged = logRevision !== oldLogRevision;
+    // Realtime decrypt must not wipe the plot (that was the jump).
+    if (structuralChange || (revisionChanged && timelineMode !== "realtime")) {
       clearChartInstantly();
-      if (timelineMode !== oldTimelineMode || logRevision !== oldLogRevision) {
-        seriesCache.clear();
-      }
+      seriesCache.clear();
+    } else if (revisionChanged) {
+      seriesCache.clear();
     }
 
     if (!Array.isArray(log) || log.length === 0) return;
 
-    // Ждем пока UNITS_FOUND заполнится данными
     if (UNITS_FOUND.value.size === 0) return;
+
+    if (timelineMode === "realtime" && !structuralChange) {
+      queueRealtimeChartUpdate(log, legendKey);
+      return;
+    }
 
     await updateChart(log, legendKey);
   },
   { immediate: true }
-);
-
-// Realtime обновления при добавлении новых данных
-watch(
-  [() => safeLog.value.length, () => props.logRevision],
-  async ([newLen, logRevision], [oldLen, oldLogRevision]) => {
-    if (!isRealtime.value || !chartRef.value || isUpdatingChart.value) return;
-    const lengthIncreased = newLen > oldLen;
-    const revisionChanged = logRevision !== oldLogRevision;
-    if (!lengthIncreased && !revisionChanged) return;
-
-    if (revisionChanged) seriesCache.clear();
-    await updateChart(safeLog.value);
-  }
-);
-
-// Watcher для принудительного обновления при изменении режима таймлайна
-watch(
-  () => mapState.timelineMode.value,
-  async (newMode, oldMode) => {
-    if (newMode !== oldMode && chartRef.value && safeLog.value.length > 0) {
-      // Очищаем кэш серий при смене режима таймлайна
-      seriesCache.clear();
-
-      // Принудительно обновляем график при смене режима таймлайна
-      await updateChart(safeLog.value, activeLegendKey.value);
-    }
-  }
 );
 
 // Обновление найденных единиц измерения и графика при изменении данных
@@ -1234,7 +1253,11 @@ watch(
       if (!point.data) continue;
       Object.keys(point.data).forEach((id) => newUnits.add(id.toLowerCase()));
     }
-    UNITS_FOUND.value = newUnits;
+    const nextSig = [...newUnits].sort().join("|");
+    const prevSig = [...UNITS_FOUND.value].sort().join("|");
+    if (nextSig !== prevSig) {
+      UNITS_FOUND.value = newUnits;
+    }
 
     if (!isRealtime.value) {
       updateChart(newLog);

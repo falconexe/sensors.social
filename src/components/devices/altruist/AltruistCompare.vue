@@ -46,7 +46,7 @@
       <p>{{ $t("Here is how Altruist measures up, feature by feature.") }}</p>
     </div>
 
-    <div class="compare-table">
+    <div class="compare-table" tabindex="0">
       <table>
         <thead>
           <tr>
@@ -77,23 +77,12 @@
               :key="i"
               :class="getMarkClass(value.mark)"
             >
-              <template v-if="isMobile">
-                <div class="device-mobile-label">
-                  <img
-                    :src="deviceHeaders[i].img"
-                    :alt="deviceHeaders[i].name"
-                    class="device-label-img"
-                  />
-                  <span class="device-label-title">{{ deviceHeaders[i].name }}</span>
-                </div>
-              </template>
-
-              <template v-if="row.feature === 'Price' && i < 2">
-                <a :href="i === 0 ? urbanLink : storeLink"
+              <template v-if="row.id === 'price' && i < 2">
+                <a :href="i === 0 ? urbanLink : storeLink" target="_blank" rel="noopener"
                   ><b>{{ formatValue(value) }}</b></a
                 >
               </template>
-              <template v-else-if="row.feature === 'Price'">
+              <template v-else-if="row.id === 'price'">
                 <b>{{ formatValue(value) }}</b>
               </template>
               <template v-else>
@@ -112,7 +101,7 @@
 </template>
 
 <script setup>
-import { computed, ref, onMounted, onUnmounted } from "vue";
+import { computed } from "vue";
 
 import altruistImg from "@/assets/images/altruist-device/Altruist-bundle.webp";
 import purpleAirImg from "@/assets/images/compare-table/purpleAir-device.webp";
@@ -123,7 +112,7 @@ import airVisualImg from "@/assets/images/compare-table/airvisual-device.webp";
 import { useI18n } from "vue-i18n";
 const { t: $t } = useI18n();
 
-const props = defineProps({
+defineProps({
   gif: { type: Boolean, default: false },
   promo: { type: Boolean, default: false },
 });
@@ -169,6 +158,7 @@ const storeLink = computed(() => buildStoreLink(STORE_URLS.dual));
 
 const tableData = [
   {
+    id: "price",
     feature: $t("Price"),
     urban: { value: "€210 ($244)", mark: " " },
     altruist: { value: "€360 ($418)", mark: " " },
@@ -355,15 +345,6 @@ const tableData = [
 
 const formatValue = (valObj) => valObj?.value || "";
 const getMarkClass = (mark) => (mark?.trim() ? `mark-${mark}` : "");
-
-const isMobile = ref(window.innerWidth < 1000);
-
-const updateMobile = () => {
-  isMobile.value = window.innerWidth < 1000;
-};
-
-onMounted(() => window.addEventListener("resize", updateMobile));
-onUnmounted(() => window.removeEventListener("resize", updateMobile));
 </script>
 
 <style scoped>
@@ -371,13 +352,14 @@ onUnmounted(() => window.removeEventListener("resize", updateMobile));
   width: 100%;
   max-width: 100%;
   margin: calc(var(--gap) * 1.25) 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
 }
 
-@media (width >= 1000px) {
-  .compare-table {
-    overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
-  }
+.compare-table:focus-visible {
+  outline: 2px solid var(--color-green-bright, #8bc34a);
+  outline-offset: 2px;
 }
 
 table {
@@ -387,24 +369,10 @@ table {
   margin: 0;
 }
 
-@media (width >= 1000px) {
-  table {
-    min-width: 1320px;
-  }
-}
-
-.device-photo,
-.device-label-img {
-  display: inline-block;
-  object-fit: contain;
-}
-
 .device-photo {
+  display: inline-block;
   max-width: 150px;
-}
-
-.device-label-img {
-  max-width: 40px;
+  object-fit: contain;
 }
 
 td:first-child {
@@ -419,13 +387,6 @@ th:not(:first-child) {
   text-align: center;
 }
 
-h2 {
-  position: sticky;
-  top: 0;
-  background-color: var(--app-bodybg);
-  z-index: 1000;
-}
-
 .mark-good {
   background-color: var(--color-green-bright);
 }
@@ -438,90 +399,55 @@ h2 {
   background-color: var(--color-bright-green-dim);
 }
 
-@media (width > 1000px) {
-  thead tr:first-child th {
-    position: sticky;
-    top: 3.5rem; /* чтобы не перекрывало h2 */
-    background: var(--app-bodybg);
-    z-index: 999;
-  }
-}
-
-/* When table is horizontally scrollable, avoid sticky interactions */
 @media (width >= 1000px) {
-  h2 {
-    position: static;
-  }
-
-  thead tr:first-child th {
-    position: static;
+  table {
+    min-width: 1480px;
   }
 }
 
 @media (width < 1000px) {
-  .compare-table {
-    max-width: 760px;
-    margin-left: auto;
-    margin-right: auto;
-  }
-
-  table,
-  thead,
-  tbody,
-  th,
-  td,
-  tr {
-    display: block;
-  }
-
-  thead tr {
-    display: none;
-  }
-
-  tr {
-    margin-bottom: calc(var(--gap) * 2);
-    /* border-bottom: 2px solid var(--app-bordercolor); */
-    max-width: 760px;
-    margin-left: auto;
-    margin-right: auto;
-  }
-
-  td {
-    position: relative;
-    min-height: 40px;
-    border: none;
-    border-bottom: 1px solid var(--app-bordercolor);
-    text-align: center !important;
-  }
-
-  td:first-child {
-    font-weight: 900;
-    text-transform: uppercase;
-    border-bottom: 0;
-  }
-
-  td:last-child {
-    border-bottom: 0;
+  table {
+    width: 980px;
+    min-width: 980px;
+    table-layout: fixed;
+    border-collapse: separate;
+    border-spacing: 0;
   }
 
   .device-photo {
-    display: none;
+    max-width: 72px;
   }
 
-  .device-mobile-label {
-    display: flex;
-    gap: calc(var(--gap) / 2);
-    align-items: center;
-    justify-content: center;
-    font-weight: bold;
-    margin-bottom: calc(var(--gap) / 2);
+  th,
+  td {
+    padding: calc(var(--gap) * 0.65);
+    font-size: 0.9em;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    vertical-align: top;
   }
 
-  tbody tr:last-child td,
-  tfoot tr:last-child td {
-    border-bottom-width: 1px;
+  th:first-child,
+  td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 2;
+    width: 7.5rem;
+    background: var(--app-bodybg);
+    box-shadow: 4px 0 8px rgba(0, 0, 0, 0.06);
+  }
+
+  thead th:first-child {
+    z-index: 3;
+  }
+
+  th:not(:first-child),
+  td:not(:first-child) {
+    width: 144px;
   }
 }
+
 .gif {
   display: block;
   width: 100%;

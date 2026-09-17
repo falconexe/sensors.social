@@ -6,6 +6,8 @@ import { dayISO, dayBoundsUnix, timelineFetchBounds } from "../../date";
 import { mapLayerUnitIds, sortMapLayerUnits } from "../../../measurements/tools";
 import { settings, excluded_sensors } from "@config";
 import { decryptMeasurementBag } from "@/utils/sensorValueCrypto";
+import { decodeSignedEnvelopeBatchToPoints, decryptProtoPrivate } from "@/utils/proto/decodeEnvelope";
+import { canonicalSensorId, sensorIdToHex, sensorIdToSs58 } from "@/utils/sensorId";
 
 // Глобальные константы провайдеров
 const REMOTE_PROVIDER = new Provider(settings.REMOTE_PROVIDER);
@@ -57,14 +59,16 @@ async function decryptSensorHistoryEntries(sensorId, entries, ownerAddress) {
 
   return Promise.all(
     entries.map(async (entry) => {
-      if (!entry?.data || typeof entry.data !== "object") return entry;
-      const data = await decryptMeasurementBag(sensorId, entry.data, ownerAccount);
-      return data === entry.data ? entry : { ...entry, data };
+      let next = entry;
+      if (Array.isArray(entry?.protoPrivate) && entry.protoPrivate.length > 0) {
+        next = await decryptProtoPrivate(entry, ownerAccount);
+      }
+      if (!next?.data || typeof next.data !== "object") return next;
+      const data = await decryptMeasurementBag(sensorId, next.data, ownerAccount);
+      return data === next.data ? next : { ...next, data };
     })
   );
 }
-
-
 
 /**
  * Day fetch bounds aligned with getSensorDataWithCache: for today end = now, not end-of-day.
@@ -74,7 +78,7 @@ export function sensorFetchBoundsForDate(isoDate) {
 }
 
 async function fetchSensorV2Payload(sensorId, startTimestamp, endTimestamp, signal = null) {
-  const sid = String(sensorId || "");
+  const sid = sensorIdToHex(sensorId) || String(sensorId || "").trim();
   if (!sid) return null;
 
   const key = `${sid}:${startTimestamp}:${endTimestamp}`;
@@ -101,6 +105,121 @@ async function fetchSensorV2Payload(sensorId, startTimestamp, endTimestamp, sign
 
   sensorV2Inflight.set(key, promise);
   return promise;
+}
+
+export { canonicalSensorId, sensorIdToHex, sensorIdToSs58 } from "@/utils/sensorId";
+
+function unixToMs(ts) {
+  const n = Number(ts);
+  if (!Number.isFinite(n) || n <= 0) return NaN;
+  return n < 1e12 ? Math.trunc(n * 1000) : Math.trunc(n);
+}
+
+/** v3 ranges are `[start, end)` in milliseconds; v2 sensor ranges are inclusive seconds. */
+function unixToExclusiveEndMs(ts) {
+  const n = Number(ts);
+  if (!Number.isFinite(n) || n <= 0) return NaN;
+  return n < 1e12 ? Math.trunc(n + 1) * 1000 : Math.trunc(n) + 1;
+}
+
+function protoPointsToHistory(points) {
+  if (!Array.isArray(points) || points.length === 0) return [];
+  return points
+    .map((point) => {
+      const ts = Number(point?.timestamp);
+      if (!Number.isFinite(ts) || !point?.data || typeof point.data !== "object") return null;
+      const entry = { timestamp: ts, data: point.data, proto: true };
+      if (
+        point.geo &&
+        Number.isFinite(Number(point.geo.lat)) &&
+        Number.isFinite(Number(point.geo.lng))
+      ) {
+        entry.geo = point.geo;
+      }
+      if (Array.isArray(point.protoPrivate) && point.protoPrivate.length > 0) {
+        entry.protoPrivate = point.protoPrivate;
+      }
+      return entry;
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.timestamp - b.timestamp);
+}
+
+let rosemanV3MessagesSupported = true;
+const ROSEMAN_V3_LATEST_MAX_MS = 24 * 60 * 60 * 1000;
+
+function rosemanV3Url(path, params) {
+  const base = String(settings.REMOTE_PROVIDER || "").replace(/\/?$/, "/");
+  return `${base}${path}?${params}`;
+}
+
+/**
+ * Binary `SignedEnvelopeBatch` from RoSeMAN. Only verified envelopes become points.
+ * @returns {{ points: object[], cursor: string }|null} null if aborted
+ */
+async function fetchRosemanV3ProtobufPoints(path, params, signal = null) {
+  if (!rosemanV3MessagesSupported) return { points: [], cursor: "" };
+  try {
+    if (signal?.aborted) return null;
+    const res = await fetch(rosemanV3Url(path, params), {
+      credentials: "omit",
+      cache: "no-store",
+      signal,
+    });
+    if (res.status === 404) {
+      rosemanV3MessagesSupported = false;
+      return { points: [], cursor: "" };
+    }
+    if (!res.ok) return { points: [], cursor: "" };
+    const buf = new Uint8Array(await res.arrayBuffer());
+    return {
+      points:
+        buf.byteLength > 0
+          ? decodeSignedEnvelopeBatchToPoints(buf, { requireGeo: false, verbose: false })
+          : [],
+      cursor: res.headers.get("X-Next-Cursor") || "",
+    };
+  } catch (error) {
+    if (error?.name === "AbortError" || signal?.aborted) return null;
+    return { points: [], cursor: "" };
+  }
+}
+
+/**
+ * Day/week/month chart history from RoSeMAN protobuf (`SignedEnvelopeBatch`).
+ * Empty / 404 / decode-miss falls through to v2 JSON in getSensorData.
+ */
+async function fetchSensorV3ProtobufLogs(
+  sensorId,
+  startTimestamp,
+  endTimestamp,
+  signal = null
+) {
+  const hex = sensorIdToHex(sensorId);
+  if (!hex) return [];
+  const startMs = unixToMs(startTimestamp);
+  const endMs = unixToExclusiveEndMs(endTimestamp);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs >= endMs) return [];
+
+  const points = [];
+  let cursor = "";
+
+  for (let page = 0; page < 32; page++) {
+    const params = new URLSearchParams({
+      start: String(startMs),
+      end: String(endMs),
+      limit: "1000",
+      sensor_id: hex,
+    });
+    if (cursor) params.set("cursor", cursor);
+    const pageResult = await fetchRosemanV3ProtobufPoints("api/v3/messages", params, signal);
+    if (pageResult === null) return null;
+    points.push(...pageResult.points);
+    cursor = pageResult.cursor;
+    if (!cursor) break;
+  }
+
+  return protoPointsToHistory(points);
 }
 
 // Cache latest v2 meta for a sensor to drive UI (owner sensors dropdown, etc.)
@@ -136,11 +255,11 @@ export function hasSensorOwner(item) {
 export function parseBundleSensorEntry(entry) {
   if (entry == null) return null;
   if (typeof entry === "string" || typeof entry === "number") {
-    const sensor_id = String(entry).trim();
+    const sensor_id = canonicalSensorId(entry);
     return sensor_id ? { sensor_id, device_model: null } : null;
   }
   if (typeof entry === "object") {
-    const sensor_id = String(entry.sensor_id || entry.id || "").trim();
+    const sensor_id = canonicalSensorId(entry.sensor_id || entry.id);
     if (!sensor_id) return null;
     const dm = entry.device_model ?? entry.model ?? null;
     return {
@@ -802,14 +921,15 @@ function markerRowsFromSensorData(historyData, { includeLiveData = false } = {})
     const lng = parseFloat(sensorData.geo.lng);
 
     const sensorInfo = {
-      sensor_id: sensorData.sensor_id,
+      sensor_id: canonicalSensorId(sensorData.sensor_id),
       model: sensorData.model || 2,
       geo: { lat, lng },
       address: sensorData.address || null,
       donated_by: sensorData.donated_by || null,
-      owner: String(sensorData.owner || "").trim() || null,
+      owner: normalizeOwnerKey(sensorData) || null,
       device_model: sensorData.device_model || null,
       timestamp: sensorData.timestamp || null,
+      proto: sensorData.proto === true,
       sensors:
         Array.isArray(sensorData.sensors) && sensorData.sensors.length > 0
           ? sensorData.sensors
@@ -857,7 +977,61 @@ export async function getSensors(start, end, provider = "remote", cacheContext =
     ? await loadMarkersListRaw(start, end, cacheContext.isoDate, cacheContext.timelineMode)
     : await REMOTE_PROVIDER.getSensorsForPeriod(start, end);
 
-  return markerRowsFromSensorData(historyData);
+  return markerRowsFromSensorData(await attachRosemanV3Proto(historyData, start, end));
+}
+
+async function attachRosemanV3Proto(sensors, start, end) {
+  if (!Array.isArray(sensors) || sensors.length === 0) return sensors;
+  const startMs = unixToMs(start);
+  const endMs = unixToExclusiveEndMs(end);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs >= endMs) {
+    return sensors;
+  }
+
+  const points = [];
+  try {
+    for (let chunkStart = startMs; chunkStart < endMs; chunkStart += ROSEMAN_V3_LATEST_MAX_MS) {
+      const chunkEnd = Math.min(chunkStart + ROSEMAN_V3_LATEST_MAX_MS, endMs);
+      if (chunkEnd <= chunkStart) break;
+      const params = new URLSearchParams({
+        start: String(chunkStart),
+        end: String(chunkEnd),
+      });
+      const page = await fetchRosemanV3ProtobufPoints("api/v3/messages/latest", params);
+      if (!page) break;
+      points.push(...page.points);
+      if (!rosemanV3MessagesSupported) break;
+    }
+  } catch {
+    return sensors;
+  }
+
+  if (points.length === 0) return sensors;
+
+  const protoIds = new Set();
+  for (const point of points) {
+    const sid = String(point?.sensor_id || "").trim();
+    if (!sid) continue;
+    protoIds.add(sid);
+    const hex = sensorIdToHex(sid);
+    if (hex) protoIds.add(hex);
+    const ss58 = sensorIdToSs58(sid);
+    if (ss58) protoIds.add(ss58);
+  }
+
+  return sensors.map((sensor) => {
+    const raw = String(sensor?.sensor_id || "").trim();
+    const hex = sensorIdToHex(raw);
+    const ss58 = sensorIdToSs58(raw);
+    if (
+      protoIds.has(raw) ||
+      (hex && protoIds.has(hex)) ||
+      (ss58 && protoIds.has(ss58))
+    ) {
+      return { ...sensor, proto: true };
+    }
+    return sensor;
+  });
 }
 
 /**
@@ -1082,11 +1256,19 @@ export function filterOwnerBundleNearAnchor(items, anchorGeo, activeSensorId, ma
   const list = Array.isArray(items) ? items.filter(Boolean) : [];
   if (list.length === 0) return list;
 
+  const sid = String(activeSensorId || "");
   const withGeo = list.filter((o) => o?.geo && hasValidCoordinates(o.geo));
-  if (!anchorGeo || !hasValidCoordinates(anchorGeo)) {
-    return withGeo;
+  const nearby =
+    !anchorGeo || !hasValidCoordinates(anchorGeo)
+      ? withGeo
+      : withGeo.filter((o) => haversineKm(anchorGeo, o.geo) <= maxKm);
+
+  if (sid && !nearby.some((o) => String(o.id) === sid)) {
+    const self = list.find((o) => String(o.id) === sid);
+    if (self) return [self, ...nearby];
   }
-  return withGeo.filter((o) => haversineKm(anchorGeo, o.geo) <= maxKm);
+
+  return nearby;
 }
 
 /**
@@ -1099,7 +1281,7 @@ export function collectOwnerDeviceIds(ownerKey, sensorsList) {
     ...new Set(
       (Array.isArray(sensorsList) ? sensorsList : [])
         .filter((s) => normalizeOwnerKey(s) === owner)
-        .map((s) => String(s?.sensor_id || ""))
+        .map((s) => String(s?.sensor_id || "").trim())
         .filter(Boolean)
     ),
   ];
@@ -1236,24 +1418,32 @@ export async function getSensorData(
         return Array.isArray(historyData) ? historyData : null;
       }
     } else {
-      const payload = await fetchSensorV2Payload(
-        sensorId,
-        startTimestamp,
-        endTimestamp,
-        signal
-      );
+      const [protoLogs, payload] = await Promise.all([
+        fetchSensorV3ProtobufLogs(sensorId, startTimestamp, endTimestamp, signal),
+        fetchSensorV2Payload(sensorId, startTimestamp, endTimestamp, signal).catch((error) => {
+          if (error?.name === "AbortError" || signal?.aborted) throw error;
+          return null;
+        }),
+      ]);
+      if (signal?.aborted) return null;
       if (payload?.sensor && typeof payload.sensor === "object") {
         cacheSensorMetaForBundle(sensorId, payload.sensor);
       } else if (payload != null) {
         // v2 responded without owner meta — avoid duplicate owner workaround fetch this session.
         rosemanOwnerWorkaroundCache.set(String(sensorId), { owner: null, ts: Date.now() });
       }
-      let historyData = payload?.result;
       const owner = normalizeOwnerKey(payload?.sensor);
+      if (Array.isArray(protoLogs) && protoLogs.length > 0) {
+        return owner
+          ? await decryptSensorHistoryEntries(sensorId, protoLogs, owner)
+          : protoLogs;
+      }
+      let historyData = payload?.result;
       if (Array.isArray(historyData) && owner) {
         historyData = await decryptSensorHistoryEntries(sensorId, historyData, owner);
       }
-      // Если данных нет, возвращаем [] (загружено, но пусто), если null/undefined - null (не загружено)
+      // null protoLogs = aborted v3; otherwise fall back to v2 (or null if v2 also missing)
+      if (protoLogs === null && !Array.isArray(historyData)) return null;
       return Array.isArray(historyData) ? historyData : null;
     }
   } catch (error) {
@@ -1370,6 +1560,8 @@ export async function fetchSensorCities() {
 // ==================== INDEXEDDB CACHE FUNCTIONS ====================
 
 const SENSOR_IDB_TTL = 24 * 60 * 60 * 1000; // 24 hours
+/** Bump when log shape changes (proto history) so stale IDB day caches are ignored. */
+const SENSOR_LOG_CACHE_GEN = 3;
 
 function stripSensorCacheAddress(entry) {
   if (!entry || !("address" in entry)) return entry;
@@ -1437,14 +1629,18 @@ async function getCachedData(sensorId, dates) {
     const sensorData = await readSensorIdbEntry(sensorId);
 
     if (sensorData && isFreshSensorIdbEntry(sensorData)) {
-      for (const date of dates) {
-        if (sensorData.data && sensorData.data[date]) {
-          cachedData.data[date] = sensorData.data[date];
-        }
-      }
       cachedData.owner = sensorData.owner ?? null;
       cachedData.type = sensorData.type ?? null;
       cachedData.lastUpdated = Number(sensorData.lastUpdated || 0);
+      if (Number(sensorData.logCacheGen) === SENSOR_LOG_CACHE_GEN) {
+        for (const date of dates) {
+          if (sensorData.data && sensorData.data[date]) {
+            cachedData.data[date] = sensorData.data[date];
+          }
+        }
+      } else {
+        cachedData.lastUpdated = 0;
+      }
     }
 
     return cachedData;
@@ -1495,6 +1691,7 @@ async function saveToCache(sensorId, dataByDate, meta = {}) {
       type: finalType,
       lastUpdated: now,
       ttl: 24 * 60 * 60 * 1000,
+      logCacheGen: SENSOR_LOG_CACHE_GEN,
     });
 
     await new Promise((resolve) => {

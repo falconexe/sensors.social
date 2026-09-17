@@ -184,7 +184,7 @@ export function clearAllMarkers() {
  */
 export function removeMarker(sensorId) {
   if (!sensorId) return;
-  
+
   const marker = findMarker(sensorId);
   if (marker) {
     const ctx = getMapContext();

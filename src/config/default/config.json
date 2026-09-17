@@ -6,7 +6,7 @@
       "/dns4/3.pubsub.sensors.social/tcp/443/wss/ipfs/QmWZSKTEQQ985mnNzMqhGCrwQ1aTA6sxVsorsycQz9cQrw"
     ]
   },
-  "REMOTE_PROVIDER": "https://roseman.robonomics.network/",
+  "REMOTE_PROVIDER": "https://roseman.staging.sensors.social/",
   "WIND_PROVIDER": "https://wind.sensors.social/latest",
   "MAP": {
     "zoom": "3",

@@ -18,6 +18,7 @@ export default {
   "notice_with_fz": "The specified data is not legally significant information for general use and special information in accordance with the federal law of July 19, 1998 no 113-fz «On the hydrometeorological service»",
   "notice_without_fz": "This information holds no legal validity and is intended solely for personal use.",
   "sensorpopup.infotitle": "Advanced information",
+  "sensorpopup.proto_signed": "Protobuf, signature verified",
   "sensorpopup.bookmarkplaceholder": "Save this sensor in bookmarks",
   "sensorpopup.bookmarkbutton": "Add to Bookmarks",
   "sensorpopup.editbookmark": "Edit bookmark",

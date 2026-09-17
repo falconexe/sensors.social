@@ -8,6 +8,7 @@ import {
   listBundleSensorEntries,
   hasSensorOwner,
   sensorTypeFromDeviceModel,
+  canonicalSensorId,
 } from "../utils/map/sensors/requests";
 
 import diyPrototypeIcon from "@/assets/images/altruist-device/altruist-diy-prototype.webp";
@@ -40,7 +41,7 @@ export function resolveSensorType(point, logOverride = null) {
   if (sid) {
     const meta = getCachedSensorMeta(sid);
     if (meta) {
-      const entry = listBundleSensorEntries(meta).find((e) => String(e.sensor_id) === sid);
+      const entry = listBundleSensorEntries(meta).find((e) => String(e.sensor_id || "") === sid);
       const fromMeta = sensorTypeFromDeviceModel(entry?.device_model);
       if (fromMeta) return fromMeta;
       const fromMetaLog = inferDeviceTypeFromLog(meta?.data?.[sid]);
@@ -54,9 +55,9 @@ export function resolveSensorType(point, logOverride = null) {
   return "altruist";
 }
 
-/** Short id for picker label: `4Hq6vZ…YUrZV`. */
+/** Short id for picker label: `4Hq6vZ…YUrZV` (Robonomics SS58 prefix 32). */
 export function formatSensorIdShort(id) {
-  const s = String(id || "");
+  const s = canonicalSensorId(id);
   if (!s) return "";
   if (s.length <= 14) return s;
   return `${s.slice(0, 6)}…${s.slice(-6)}`;
