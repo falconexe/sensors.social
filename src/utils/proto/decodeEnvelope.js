@@ -1,5 +1,6 @@
 /**
- * From buf.build/airalab/connectivity-protocol.
+ * connectivity-protocol v1-beta.2.
+ * Sign: sensor_id || nonce || message. Timestamp and node_id live in Meta.
  * Public Urban/Insight always; private[] is decrypted with the owner seed (same CPS AES-GCM as JSON).
  */
 
@@ -45,15 +46,6 @@ function concatBytes(parts) {
   return out;
 }
 
-function timestampLe64(ms) {
-  const buf = new Uint8Array(8);
-  const view = new DataView(buf.buffer);
-  const big = typeof ms === "bigint" ? ms : BigInt(ms);
-  view.setUint32(0, Number(big & 0xffffffffn), true);
-  view.setUint32(4, Number((big >> 32n) & 0xffffffffn), true);
-  return buf;
-}
-
 function ss58(pubkey) {
   if (!pubkey || pubkey.length !== 32) {
     return "";
@@ -62,7 +54,15 @@ function ss58(pubkey) {
 }
 
 function finite(n) {
+  if (typeof n === "bigint") {
+    n = Number(n);
+  }
   return typeof n === "number" && Number.isFinite(n) ? n : null;
+}
+
+function scaled(n, div) {
+  const v = finite(n);
+  return v == null ? null : v / div;
 }
 
 function applyBme(measurement, data) {
@@ -70,13 +70,13 @@ function applyBme(measurement, data) {
     return;
   }
   if (measurement.case === "temperature") {
-    const n = finite(measurement.value?.celsius);
+    const n = scaled(measurement.value?.centiCelsius, 100);
     if (n != null) data.temperature = n;
   } else if (measurement.case === "humidity") {
-    const n = finite(measurement.value?.percent);
+    const n = scaled(measurement.value?.centiPercent, 100);
     if (n != null) data.humidity = n;
   } else if (measurement.case === "pressure") {
-    const n = finite(measurement.value?.pascal);
+    const n = scaled(measurement.value?.deciPascal, 10);
     if (n != null) data.pressure = pressureToMmHg(n);
   }
 }
@@ -86,10 +86,10 @@ function applySds(measurement, data) {
     return;
   }
   if (measurement.case === "pm25") {
-    const n = finite(measurement.value?.ugM3);
+    const n = scaled(measurement.value?.deciUgM3, 10);
     if (n != null) data.pm25 = n;
   } else if (measurement.case === "pm10") {
-    const n = finite(measurement.value?.ugM3);
+    const n = scaled(measurement.value?.deciUgM3, 10);
     if (n != null) data.pm10 = n;
   }
 }
@@ -117,20 +117,21 @@ function applyScd(measurement, data) {
     return;
   }
   if (measurement.case === "temperature") {
-    const n = finite(measurement.value?.celsius);
+    const n = scaled(measurement.value?.centiCelsius, 100);
     if (n != null) data.temperature = n;
     return;
   }
   if (measurement.case === "humidity") {
-    const n = finite(measurement.value?.percent);
+    const n = scaled(measurement.value?.centiPercent, 100);
     if (n != null) data.humidity = n;
     return;
   }
+  // Decrypted Insight sections can parse into a flat shape instead of the `measurement` oneof.
   const ppm = finite(measurement.ppm) ?? finite(measurement.co2?.ppm);
   if (ppm != null) data.co2 = ppm;
-  const celsius = finite(measurement.celsius) ?? finite(measurement.temperature?.celsius);
+  const celsius = scaled(measurement.centiCelsius ?? measurement.temperature?.centiCelsius, 100);
   if (celsius != null) data.temperature = celsius;
-  const percent = finite(measurement.percent) ?? finite(measurement.humidity?.percent);
+  const percent = scaled(measurement.centiPercent ?? measurement.humidity?.centiPercent, 100);
   if (percent != null) data.humidity = percent;
 }
 
@@ -182,14 +183,7 @@ function verifyEnvelope(env) {
   if (!env.signature || env.signature.length !== 64) return false;
   if (!env.nonce || env.nonce.length < 16 || env.nonce.length > 32) return false;
   if (!env.message || env.message.length === 0) return false;
-  const ts = typeof env.timestamp === "bigint" ? Number(env.timestamp) : env.timestamp;
-  if (!Number.isFinite(ts) || ts <= 0) return false;
-  const preimage = concatBytes([
-    env.sensorId,
-    timestampLe64(env.timestamp),
-    env.nonce,
-    env.message,
-  ]);
+  const preimage = concatBytes([env.sensorId, env.nonce, env.message]);
   try {
     return ed25519.verify(env.signature, preimage, env.sensorId);
   } catch {
@@ -362,7 +356,6 @@ function envelopeToPoint(env, opts = {}) {
     return fail("no-public-gps");
   }
   const sensor_id = ss58(env.sensorId);
-  const owner = ss58(message.metadata?.owner) || undefined;
   if (!sensor_id) {
     return fail("bad-sensor-id");
   }
@@ -370,7 +363,11 @@ function envelopeToPoint(env, opts = {}) {
   if (Object.keys(folded.measurement).length === 0 && protoPrivate.length === 0) {
     return fail("no-measurements");
   }
-  const tsMs = typeof env.timestamp === "bigint" ? Number(env.timestamp) : env.timestamp;
+  const tsMs = finite(message.metadata?.timestamp);
+  if (tsMs == null || tsMs <= 0) {
+    return fail("bad-timestamp");
+  }
+  const node_id = finite(message.metadata?.nodeId) ?? 0;
   const data =
     protoPrivate.length > 0
       ? fillProtoPrivatePlaceholders(folded.measurement, kind)
@@ -381,7 +378,7 @@ function envelopeToPoint(env, opts = {}) {
     model: kind === "insight" ? 3 : 2,
     geo: folded.geo || undefined,
     data,
-    owner,
+    node_id,
     device_model: kind,
     timestamp: Math.floor(tsMs / 1000),
     proto: true,

@@ -19,6 +19,7 @@ import {
   getSensorDataWithCache,
   getMaxData,
   getSensorOwner,
+  lookupRosemanOwner,
   getCachedSensorIdbMeta,
   getCachedSensorMeta,
   clearSensorMetaCache,
@@ -131,6 +132,7 @@ const recentlyClosed = ref({ id: null, until: 0 });
 const isUpdatingPopup = ref(false);
 const realtimeLiveSensorIds = ref(new Set());
 const realtimeHydratedSid = ref(null);
+const protoOwnerHydrateInflight = new Set();
 
 // --- Computed ---
 
@@ -592,22 +594,26 @@ export function useSensors() {
     if (fromUrl) return fromUrl;
 
     const fromPoint = normalizeOwnerKey(point);
-    if (fromPoint) return fromPoint;
+    const isProto = point?.proto === true;
+    if (fromPoint && !isProto) return fromPoint;
 
     const sid = sensorId ? String(sensorId) : "";
     if (!sid) return "";
 
     const fromMap = sensors.value.find((s) => String(s?.sensor_id || "") === sid);
     const mapOwner = normalizeOwnerKey(fromMap);
-    if (mapOwner) return mapOwner;
+    if (mapOwner && !isProto) return mapOwner;
 
     const idb = await getCachedSensorIdbMeta(sid);
-    if (idb?.type === "diy") return "";
-    if (idb?.owner) return String(idb.owner).trim();
+    if (idb?.type === "diy" && !isProto) return "";
+    if (idb?.owner && !isProto) return String(idb.owner).trim();
 
     const viewedDay = mapState.currentDate.value || dayISO();
+    if (isProto) {
+      return (await lookupRosemanOwner(sid, viewedDay)) || "";
+    }
     const fromApi = await getSensorOwner(sid, viewedDay);
-    return fromApi || "";
+    return fromApi || mapOwner || fromPoint || "";
   };
 
   /**
@@ -654,9 +660,11 @@ export function useSensors() {
         protoPrivate:
           data.protoPrivate !== undefined ? data.protoPrivate : existingSensor.protoPrivate,
         owner:
-          data.owner !== undefined && String(data.owner || "").trim() !== ""
-            ? normalizeOwnerKey({ owner: data.owner })
-            : existingSensor.owner,
+          data.owner === null
+            ? null
+            : data.owner !== undefined && String(data.owner || "").trim() !== ""
+              ? normalizeOwnerKey({ owner: data.owner })
+              : existingSensor.owner,
       };
       existingSensors[sensorIndex] = formatPointForSensor(updatedSensor, { calculateValue: false });
     } else {
@@ -2173,6 +2181,37 @@ export function useSensors() {
     }
   };
 
+  const hydrateProtoOwnerFromProd = async (sensorId) => {
+    const sid = String(sensorId || "");
+    if (!sid || protoOwnerHydrateInflight.has(sid)) return;
+    protoOwnerHydrateInflight.add(sid);
+    try {
+      const owner = await lookupRosemanOwner(sid, mapState.currentDate.value || dayISO());
+      const row = (sensors.value || []).find((s) => idsEq(s?.sensor_id, sid));
+      if (!row || row.proto !== true) return;
+      const prev = normalizeOwnerKey(row);
+      if (!owner) {
+        if (!prev) return;
+        setSensorData(sid, { owner: null });
+        if (sensorPoint.value && idsEq(sensorPoint.value.sensor_id, sid)) {
+          sensorPoint.value = { ...sensorPoint.value, owner: null };
+        }
+        rebundleOwnerMarkers(prev);
+        return;
+      }
+      if (prev === owner) return;
+      setSensorData(sid, { owner });
+      if (sensorPoint.value && idsEq(sensorPoint.value.sensor_id, sid)) {
+        sensorPoint.value = { ...sensorPoint.value, owner };
+      }
+      rebundleOwnerMarkers(owner);
+      if (prev) rebundleOwnerMarkers(prev);
+    } catch (error) {
+      protoOwnerHydrateInflight.delete(sid);
+      console.warn("proto owner from prod RoSeMAN failed", sid, error);
+    }
+  };
+
   /**
    * Upsert or remove a single map marker.
    * @param {Object} point - Sensor row for the marker
@@ -2198,7 +2237,8 @@ export function useSensors() {
         ? Object.fromEntries(Object.entries(point.data).map(([k, v]) => [k.toLowerCase(), v]))
         : {};
 
-      const ownerKey = normalizeOwnerKey(point);
+      const listed = (sensors.value || []).find((s) => idsEq(s?.sensor_id, point.sensor_id));
+      const ownerKey = normalizeOwnerKey(point) || normalizeOwnerKey(listed);
       if (ownerKey) {
         const popupOwner = normalizeOwnerKey(sensorPoint.value);
         if (sensorPoint.value && popupOwner === ownerKey) {
@@ -2526,8 +2566,12 @@ export function useSensors() {
 
   // Local sensor list setters
   const setSensors = (sensorsArr) => {
-    sensors.value = Array.isArray(sensorsArr) ? sensorsArr : [];
+    const list = Array.isArray(sensorsArr) ? sensorsArr : [];
+    sensors.value = list;
     sensorsLoaded.value = true;
+    for (const s of sensors.value) {
+      if (s?.proto === true) void hydrateProtoOwnerFromProd(s.sensor_id);
+    }
   };
 
   const setSensorsNoLocation = (sensorsArr) => {
@@ -2537,6 +2581,7 @@ export function useSensors() {
   const clearSensors = () => {
     realtimeLiveSensorIds.value = new Set();
     realtimeHydratedSid.value = null;
+    protoOwnerHydrateInflight.clear();
     clearSensorMetaCache();
     sensors.value = [];
     sensorsNoLocation.value = [];

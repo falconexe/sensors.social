@@ -12,6 +12,8 @@ import { canonicalSensorId, sensorIdToHex, sensorIdToSs58 } from "@/utils/sensor
 // Глобальные константы провайдеров
 const REMOTE_PROVIDER = new Provider(settings.REMOTE_PROVIDER);
 const LIBP2P_PROVIDER = new Libp2pProvider(settings.LIBP2P);
+/** JSON-era owner for proto sensors while staging RoSeMAN is empty / CPS API is not live. */
+export const PROD_ROSEMAN_PROVIDER = "https://roseman.robonomics.network/";
 
 // Глобальный объект провайдера
 let providerObj = null;
@@ -77,11 +79,16 @@ export function sensorFetchBoundsForDate(isoDate) {
   return timelineFetchBounds(isoDate, "day");
 }
 
-async function fetchSensorV2Payload(sensorId, startTimestamp, endTimestamp, signal = null) {
+function rosemanApiBase(url) {
+  return String(url || "").replace(/\/?$/, "/");
+}
+
+async function fetchSensorV2PayloadFrom(base, sensorId, startTimestamp, endTimestamp, signal = null) {
   const sid = sensorIdToHex(sensorId) || String(sensorId || "").trim();
   if (!sid) return null;
 
-  const key = `${sid}:${startTimestamp}:${endTimestamp}`;
+  const origin = rosemanApiBase(base);
+  const key = `${origin}:${sid}:${startTimestamp}:${endTimestamp}`;
   const recent = sensorV2Recent.get(key);
   if (recent && Date.now() - recent.ts < SENSOR_V2_RECENT_MS) {
     return recent.payload;
@@ -92,7 +99,7 @@ async function fetchSensorV2Payload(sensorId, startTimestamp, endTimestamp, sign
   }
 
   const promise = fetchJson(
-    `${settings.REMOTE_PROVIDER}api/v2/sensor/${sid}/${startTimestamp}/${endTimestamp}`,
+    `${origin}api/v2/sensor/${sid}/${startTimestamp}/${endTimestamp}`,
     { cache: "no-store", signal }
   )
     .then((payload) => {
@@ -105,6 +112,16 @@ async function fetchSensorV2Payload(sensorId, startTimestamp, endTimestamp, sign
 
   sensorV2Inflight.set(key, promise);
   return promise;
+}
+
+async function fetchSensorV2Payload(sensorId, startTimestamp, endTimestamp, signal = null) {
+  return fetchSensorV2PayloadFrom(
+    settings.REMOTE_PROVIDER,
+    sensorId,
+    startTimestamp,
+    endTimestamp,
+    signal
+  );
 }
 
 export { canonicalSensorId, sensorIdToHex, sensorIdToSs58 } from "@/utils/sensorId";
@@ -1219,8 +1236,16 @@ function cacheRosemanOwnerWorkaroundMeta(sensorId, sensorMeta, owner) {
   cacheSensorMetaForBundle(sid, owner ? { ...sensorMeta, owner } : sensorMeta);
 }
 
+async function ownerFromV2Payload(base, sensorId, startTimestamp, endTimestamp) {
+  const payload = await fetchSensorV2PayloadFrom(base, sensorId, startTimestamp, endTimestamp);
+  const owner = normalizeOwnerKey(payload?.sensor);
+  if (owner) cacheRosemanOwnerWorkaroundMeta(sensorId, payload.sensor, owner);
+  return owner || null;
+}
+
 /**
  * TEMPORARY — see block above. Not the final Roseman owner lookup.
+ * Staging is often empty for proto; fall back to production JSON-era owner.
  */
 async function resolveRosemanOwnerWorkaround(sensorId, startTimestamp, endTimestamp) {
   const sid = String(sensorId || "").trim();
@@ -1231,24 +1256,22 @@ async function resolveRosemanOwnerWorkaround(sensorId, startTimestamp, endTimest
     return cached.owner;
   }
 
-  let owner = null;
   const { start: todayStart, end: todayEnd } = sensorFetchBoundsForDate(dayISO());
+  const currentBase = rosemanApiBase(settings.REMOTE_PROVIDER);
+  const prodBase = rosemanApiBase(PROD_ROSEMAN_PROVIDER);
+  const bases = currentBase === prodBase ? [currentBase] : [currentBase, prodBase];
 
-  try {
-    const todayPayload = await fetchSensorV2Payload(sid, todayStart, todayEnd);
-    owner = normalizeOwnerKey(todayPayload?.sensor);
-    if (owner) cacheRosemanOwnerWorkaroundMeta(sid, todayPayload.sensor, owner);
-  } catch {
-    // ignore
-  }
-
-  if (!owner && (startTimestamp !== todayStart || endTimestamp !== todayEnd)) {
+  let owner = null;
+  for (const base of bases) {
     try {
-      const periodPayload = await fetchSensorV2Payload(sid, startTimestamp, endTimestamp);
-      owner = normalizeOwnerKey(periodPayload?.sensor);
-      if (owner) cacheRosemanOwnerWorkaroundMeta(sid, periodPayload.sensor, owner);
+      owner = await ownerFromV2Payload(base, sid, todayStart, todayEnd);
+      if (owner) break;
+      if (startTimestamp !== todayStart || endTimestamp !== todayEnd) {
+        owner = await ownerFromV2Payload(base, sid, startTimestamp, endTimestamp);
+        if (owner) break;
+      }
     } catch {
-      // ignore
+      // try the next RoSeMAN base
     }
   }
 
@@ -1288,6 +1311,15 @@ export async function getSensorOwner(sensorId, isoDate = null) {
     console.warn("Failed to load sensor owner:", error);
     return null;
   }
+}
+
+/** Skip IDB: staging then production RoSeMAN v2 owner (for proto sensors). */
+export async function lookupRosemanOwner(sensorId, isoDate = null) {
+  const sid = String(sensorId || "").trim();
+  if (!sid) return null;
+  const viewedDay = isoDate || dayISO();
+  const { start, end } = sensorFetchBoundsForDate(viewedDay);
+  return (await resolveRosemanOwnerWorkaround(sid, start, end)) || null;
 }
 
 function geoFromLogPoints(points) {
@@ -1732,7 +1764,7 @@ export async function fetchSensorCities() {
 
 const SENSOR_IDB_TTL = 24 * 60 * 60 * 1000; // 24 hours
 /** Bump when log shape changes (proto history) so stale IDB day caches are ignored. */
-const SENSOR_LOG_CACHE_GEN = 4;
+const SENSOR_LOG_CACHE_GEN = 5;
 
 function stripSensorCacheAddress(entry) {
   if (!entry || !("address" in entry)) return entry;

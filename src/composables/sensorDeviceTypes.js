@@ -17,11 +17,24 @@ import insightDefaultIcon from "@/assets/images/altruist-device/altruist-insight
 import urbanDefaultIcon from "@/assets/images/altruist-device/altruist-urban-default-icon.webp";
 
 /**
+ * Altruist device behind a signed envelope: v1-beta.2 dropped `Meta.owner`, so ownership can be
+ * unknown while the Urban/Insight payload type still proves this is not a DIY sensor.
+ */
+export function protoDeviceType(point) {
+  if (point?.proto !== true) return null;
+  const type = sensorTypeFromDeviceModel(point.device_model);
+  return type === "urban" || type === "insight" ? type : null;
+}
+
+/**
  * Sensor device kind for UI: diy / insight / urban / altruist.
  * DIY sensors have no owner; Altruist devices use device_model (or cached IDB / bundle type).
  */
 export function resolveSensorType(point, logOverride = null) {
   if (!point) return "diy";
+
+  const fromProto = protoDeviceType(point);
+  if (fromProto) return fromProto;
 
   if (!hasSensorOwner(point)) return "diy";
 
