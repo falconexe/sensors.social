@@ -4,7 +4,7 @@
  * pollute a single map marker or popup cluster.
  */
 import { peekUserSensorsCache } from "@/composables/useAccounts";
-import { resolveSensorType } from "@/composables/sensorDeviceTypes";
+import { protoDeviceType, resolveSensorType } from "@/composables/sensorDeviceTypes";
 import { hasValidCoordinates } from "../utils/utils";
 import { dayISO } from "@/utils/date";
 import {
@@ -358,7 +358,8 @@ function findBundleEntryForSlot(bundle, slotType, preferId = null, point = null,
 export function buildSensorPickerRows(point, logSamples = null) {
   const currentId = String(point?.sensor_id || "");
   const hasOwner = hasSensorOwner(point);
-  const types = hasOwner ? OWNER_PICKER_TYPES : DIY_PICKER_TYPES;
+  const protoType = hasOwner ? null : protoDeviceType(point);
+  const types = hasOwner || protoType ? OWNER_PICKER_TYPES : DIY_PICKER_TYPES;
   const bundle = hasOwner ? point?.ownerSensorsWithData : null;
 
   const bundleRows = hasOwner
@@ -382,8 +383,13 @@ export function buildSensorPickerRows(point, logSamples = null) {
 
   const rows = types.map((type) => {
     if (!hasOwner) {
-      if (type === "diy") {
-        return { type, sensorId: currentId || null, state: currentId ? "active" : "missing" };
+      if (type === (protoType || "diy")) {
+        return {
+          type,
+          sensorId: currentId || null,
+          state: currentId ? "active" : "missing",
+          ...(protoType ? { proto: true } : null),
+        };
       }
       return { type, sensorId: null, state: "missing" };
     }

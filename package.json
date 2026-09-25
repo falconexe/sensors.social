@@ -18,7 +18,7 @@
     "fonts:convert": "node scripts/convert-fonts.mjs"
   },
   "dependencies": {
-    "@buf/airalab_connectivity-protocol.bufbuild_es": "2.14.0-20260828134001-309d77314e7b.1",
+    "@buf/airalab_connectivity-protocol.bufbuild_es": "2.14.0-20260917143433-6f6f1eba1cc0.1",
     "@bufbuild/protobuf": "^2.14.0",
     "@chainsafe/libp2p-noise": "^13.0.1",
     "@fontsource/noto-sans": "^5.2.10",

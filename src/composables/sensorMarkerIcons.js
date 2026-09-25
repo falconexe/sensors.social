@@ -5,7 +5,7 @@
  */
 import { pinned_sensors } from "@config";
 import { dayISO } from "@/utils/date";
-import { resolveSensorType, sensorTypeIcon } from "@/composables/sensorDeviceTypes";
+import { protoDeviceType, resolveSensorType, sensorTypeIcon } from "@/composables/sensorDeviceTypes";
 import {
   inferTypesForOwnerIds,
   isMarkerSiblingNearAnchor,
@@ -40,7 +40,7 @@ function findBundleEntryForSlot(bundle, slotType) {
   return list.find((o) => pickerSlotType(o, slotType) && o?.id) || null;
 }
 
-/** Collect urban/insight types from marker row + nearby siblings only. */
+/** Collect urban/insight types from marker row + nearby live siblings (same owner). */
 function ownerDeviceTypesNearAnchor(point, sensorsList = null) {
   const types = new Set();
   const addModel = (dm, sensorId) => {
@@ -53,6 +53,13 @@ function ownerDeviceTypesNearAnchor(point, sensorsList = null) {
   for (const entry of markerSensorsEntries(point, sensorsList)) {
     const parsed = parseBundleSensorEntry(entry);
     if (parsed) addModel(parsed.device_model, parsed.sensor_id);
+  }
+  const ownerKey = normalizeOwnerKey(point);
+  if (ownerKey) {
+    for (const s of Array.isArray(sensorsList) ? sensorsList : []) {
+      if (normalizeOwnerKey(s) !== ownerKey) continue;
+      addModel(s.device_model, s.sensor_id);
+    }
   }
   return types;
 }
@@ -171,7 +178,9 @@ export function mapMarkerIcon(point, sensorsList = null, isoDate = null, { force
   if (cached?.iconType) {
     const shouldUpgradeToDual = dualNow && cached.iconType !== "dual";
     const dualStillValid = cached.iconType !== "dual" || dualNow;
-    if (dualStillValid && !shouldUpgradeToDual) {
+    // Envelopes without Meta.owner were cached as DIY before the device type came from the payload.
+    const diyStillValid = cached.iconType !== "diy" || !protoDeviceType(point);
+    if (dualStillValid && !shouldUpgradeToDual && diyStillValid) {
       return {
         image: sensorTypeIcon(cached.iconType),
         fullBleed: Boolean(cached.fullBleed),
