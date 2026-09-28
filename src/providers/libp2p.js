@@ -11,7 +11,7 @@ import { decodeSignedEnvelopeToPoint, decryptProtoPrivate } from "../utils/proto
 import { useAccounts } from "@/composables/useAccounts";
 
 const topic = "airalab.lighthouse.5.robonomics.eth";
-const protoTopic = "sensors.social/v1";
+const protoTopic = "sensors.social/v1/staging";
 
 function accountHasSecret(account) {
   return Boolean(
